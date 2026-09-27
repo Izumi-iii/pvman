@@ -1,6 +1,20 @@
 # pvman
 
-A terminal UI for managing Python virtual environments — conda and uv, side by side.
+<table>
+	<tr>
+		<td width="180" align="center">
+			<img src="https://tk-pichost-1325224430.cos.ap-chengdu.myqcloud.com/blog/b842f40fe85f3b70cc2f7b89a9f6e7e0.png" alt="pvman icon" width="160">
+		</td>
+		<td>
+			<h2 align="center">
+				<span style="font-family: 'Hiragino Maru Gothic ProN', 'Yu Gothic', 'Comic Sans MS', cursive; font-size: 1.4em; font-style: italic; font-weight: 900; letter-spacing: 0.08em; padding: 0 10px 4px; border-bottom: 3px solid #9bdcff; text-shadow: 1px 1px 0 #d9f3ff;">
+					<span style="color: #4db8ff;">pv</span><span style="color: #ff4d5a;">man</span>
+				</span>
+			</h2>
+			A terminal UI for managing Python virtual environments, with conda and uv side by side.
+		</td>
+	</tr>
+</table>
 
 ![Go](https://img.shields.io/badge/Go-1.26+-00ADD8?style=flat&logo=go)
 ![Platform](https://img.shields.io/badge/platform-macOS%20%7C%20Linux%20%7C%20Windows-lightgrey)
@@ -18,20 +32,7 @@ A terminal UI for managing Python virtual environments — conda and uv, side by
 
 ## Demo
 
-```
-╭─ Environments ──────────────╮ ╭─ Details ─────────────────────────────╮
-│  conda                      │ │ agent          conda                   │
-│    base              3.13   │ │                                        │
-│  ► agent             3.11   │ │ Python    3.11.9                       │
-│                             │ │ Packages  42                           │
-│  uv  (~/code/myproject)     │ │ Size      1.2 GB                       │
-│    .venv             3.12   │ │ Path      ~/miniconda3/envs/agent      │
-│                             │ │                                        │
-│                             │ │ Activate                               │
-│                             │ │ conda activate agent                   │
-╰─────────────────────────────╯ ╰────────────────────────────────────────╯
- pvman  n new  d delete  r refresh  q quit
-```
+![1790529914591.png](https://tk-pichost-1325224430.cos.ap-chengdu.myqcloud.com/blog/1790529914591.png)
 
 ## Install
 
@@ -44,19 +45,17 @@ brew install <your-tap>/pvman
 ### Go install
 
 ```bash
-go install github.com/yourusername/pvman@latest
+go install github.com/tkzzzzzz6/pvman@latest
 ```
 
 ### Download binary
 
-Grab the latest binary for your platform from the [Releases](https://github.com/yourusername/pvman/releases) page.
+Grab the latest binary for your platform from the [Releases](https://github.com/tkzzzzzz6/pvman/releases) page.
 
 | Platform | File |
 |----------|------|
 | macOS Apple Silicon | `pvman-darwin-arm64` |
-| macOS Intel | `pvman-darwin-amd64` |
 | Linux x86_64 | `pvman-linux-amd64` |
-| Linux ARM64 | `pvman-linux-arm64` |
 | Windows x86_64 | `pvman-windows-amd64.exe` |
 
 ## Usage
@@ -89,11 +88,11 @@ It will show all your conda environments and scan the current directory for uv v
 ## Build from source
 
 ```bash
-git clone https://github.com/yourusername/pvman.git
+git clone https://github.com/tkzzzzzz6/pvman.git
 cd pvman
 go build -ldflags="-s -w" -o pvman .
 ```
 
 ## License
 
-MIT
+[MIT License](LICENSE)

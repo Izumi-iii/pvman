@@ -1,4 +1,4 @@
-module github.com/pvman/pvman
+module github.com/tkzzzzzz6/pvman
 
 go 1.26.1
 

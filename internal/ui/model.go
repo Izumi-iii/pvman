@@ -10,8 +10,8 @@ import (
 	"github.com/charmbracelet/bubbles/textinput"
 	tea "github.com/charmbracelet/bubbletea"
 	"github.com/charmbracelet/lipgloss"
-	"github.com/pvman/pvman/internal/conda"
-	"github.com/pvman/pvman/internal/uv"
+	"github.com/tkzzzzzz6/pvman/internal/conda"
+	"github.com/tkzzzzzz6/pvman/internal/uv"
 )
 
 type appState int
