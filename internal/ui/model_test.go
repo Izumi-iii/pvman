@@ -2,6 +2,9 @@ package ui
 
 import (
 	"fmt"
+	"reflect"
+	"sort"
+	"strings"
 	"testing"
 
 	tea "github.com/charmbracelet/bubbletea"
@@ -85,15 +88,17 @@ func TestPkgStateSafety(t *testing.T) {
 	}
 }
 
-func TestDeletePackagesCmdIgnoresStaleIndices(t *testing.T) {
-	// A selection map holding indices past the end of the list must not panic.
-	cmd := deletePackagesCmd("conda", 0, nil, nil,
-		map[int]bool{0: true, 5: true, 100: true}, mkPkgs(3))
+func TestDeletePackagesCmdWithNoNames(t *testing.T) {
+	cmd := deletePackagesCmd("conda", 0, nil, nil, nil)
 	if cmd == nil {
 		t.Fatal("nil cmd")
 	}
-	if _, ok := cmd().(packageDeletedMsg); !ok {
+	msg, ok := cmd().(packageDeletedMsg)
+	if !ok {
 		t.Fatal("unexpected message type")
+	}
+	if msg.err == nil {
+		t.Fatal("expected an error when nothing is named")
 	}
 }
 
@@ -279,6 +284,386 @@ func TestEnvsReloadKeepsPackageView(t *testing.T) {
 	if got := mm.(Model); got.state != statePackageList {
 		t.Fatalf("state = %v, want the package list to stay open", got.state)
 	}
+}
+
+// relModel builds a package view over a small dependency graph. packages are
+// named a..e; edges are given as "dependent:needed,needed".
+func relModel(packages []string, edges map[string][]string, selected ...string) Model {
+	deps := make(map[string][]string, len(packages))
+	dependents := make(map[string][]string, len(packages))
+	for _, p := range packages {
+		deps[p] = edges[p]
+	}
+	for pkg, needs := range deps {
+		for _, n := range needs {
+			dependents[n] = append(dependents[n], pkg)
+		}
+	}
+	for k := range dependents {
+		sort.Strings(dependents[k])
+	}
+
+	m := Model{
+		state:       statePackageList,
+		width:       100,
+		height:      30,
+		packages:    packages,
+		pkgSelected: make(map[int]bool),
+		pkgLoaded:   true,
+		deps:        deps,
+		dependents:  dependents,
+	}
+	want := make(map[string]bool, len(selected))
+	for _, s := range selected {
+		want[s] = true
+	}
+	for i, name := range packages {
+		if want[name] {
+			m.pkgSelected[i] = true
+		}
+	}
+	return m
+}
+
+// TestSelectionRelationBreaksAndOrphans covers the graph shape the dialog is
+// built on: a -> {b, c} -> d, and e -> a. Selecting a breaks e and orphans
+// b, c and (transitively) d.
+func TestSelectionRelationBreaksAndOrphans(t *testing.T) {
+	m := relModel(
+		[]string{"a", "b", "c", "d", "e"},
+		map[string][]string{
+			"a": {"b", "c"},
+			"b": {"d"},
+			"c": {"d"},
+			"d": nil,
+			"e": {"a"},
+		},
+		"a",
+	)
+
+	got := m.selectionRelation()
+	if want := []string{"e"}; !reflect.DeepEqual(got.Breaks, want) {
+		t.Errorf("Breaks = %v, want %v", got.Breaks, want)
+	}
+	// d is not a direct dependency of a; it is orphaned by b and c going away.
+	if want := []string{"b", "c", "d"}; !reflect.DeepEqual(got.Orphans, want) {
+		t.Errorf("Orphans = %v, want %v", got.Orphans, want)
+	}
+	if want := []string{"b", "c", "d", "e"}; !reflect.DeepEqual(got.All(), want) {
+		t.Errorf("All = %v, want %v", got.All(), want)
+	}
+}
+
+// TestSelectionRelationLeavesUnrelatedPackages keeps a deliberately installed
+// top-level package out of the orphan list: f depends on nothing the selection
+// touches, so deleting a must not propose removing f.
+func TestSelectionRelationLeavesUnrelatedPackages(t *testing.T) {
+	m := relModel(
+		[]string{"a", "b", "f"},
+		map[string][]string{
+			"a": {"b"},
+			"b": nil,
+			"f": nil,
+		},
+		"a",
+	)
+
+	got := m.selectionRelation()
+	if want := []string{"b"}; !reflect.DeepEqual(got.Orphans, want) {
+		t.Errorf("Orphans = %v, want %v", got.Orphans, want)
+	}
+	if got.Empty() {
+		t.Fatal("expected a non-empty relation")
+	}
+}
+
+// TestSelectionRelationCycle terminates on a dependency cycle, which conda
+// environments do contain.
+func TestSelectionRelationCycle(t *testing.T) {
+	m := relModel(
+		[]string{"a", "b", "c"},
+		map[string][]string{
+			"a": {"b"},
+			"b": {"c"},
+			"c": {"a"},
+		},
+		"a",
+	)
+
+	got := m.selectionRelation()
+	// b and c both depend, directly or not, on a; whichever way the cycle is
+	// read, the walk must finish and name each of them exactly once.
+	all := got.All()
+	if len(all) != len(dedupe(all)) {
+		t.Fatalf("All = %v contains duplicates", all)
+	}
+	for _, want := range []string{"b", "c"} {
+		if !contains(all, want) {
+			t.Errorf("All = %v, want it to contain %q", all, want)
+		}
+	}
+}
+
+// TestSelectionRelationDependentAlsoSelected makes sure a package that both
+// depends on and is depended on by the selection is not offered for deletion.
+func TestSelectionRelationDependentAlsoSelected(t *testing.T) {
+	m := relModel(
+		[]string{"a", "b", "c"},
+		map[string][]string{
+			"a": {"b"}, // a needs b
+			"b": {"a"}, // and b needs a
+			"c": {"b"},
+		},
+		"a", "b",
+	)
+
+	got := m.selectionRelation()
+	for _, n := range got.All() {
+		if n == "a" || n == "b" {
+			t.Errorf("All = %v names a package that is already selected", got.All())
+		}
+	}
+	// c is a dependent of the selection and stays behind, so it breaks.
+	if want := []string{"c"}; !reflect.DeepEqual(got.Breaks, want) {
+		t.Errorf("Breaks = %v, want %v", got.Breaks, want)
+	}
+}
+
+func TestSelectionRelationNoGraph(t *testing.T) {
+	m := pkgModel(3)
+	m.pkgSelected = map[int]bool{0: true}
+	if got := m.selectionRelation(); !got.Empty() {
+		t.Errorf("relation = %+v, want empty when there is no graph", got)
+	}
+}
+
+// TestDeleteConfirmYNESemantics pins the three-way confirmation: y deletes the
+// selection plus the related packages, n deletes only the ticked ones, and esc
+// returns to the list with nothing deleted.
+func TestDeleteConfirmYNESemantics(t *testing.T) {
+	build := func() Model {
+		m := relModel(
+			[]string{"a", "b", "e"},
+			map[string][]string{
+				"a": {"b"},
+				"b": nil,
+				"e": {"a"},
+			},
+			"a",
+		)
+		m = runKey(m, keyRune('d'))
+		if m.state != statePackageDeleteConfirm {
+			t.Fatalf("state = %v, want delete confirm", m.state)
+		}
+		return m
+	}
+
+	// y: a (ticked) + b (orphan) + e (broken dependent).
+	m := build()
+	if want := []string{"a", "b", "e"}; !reflect.DeepEqual(m.deleteSet(true), want) {
+		t.Errorf("deleteSet(true) = %v, want %v", m.deleteSet(true), want)
+	}
+	mm, cmd := m.Update(keyRune('y'))
+	if cmd == nil {
+		t.Fatal("y produced no command")
+	}
+	if got := mm.(Model); got.state != statePackageDeleting {
+		t.Errorf("y left state %v, want deleting", got.state)
+	}
+
+	// n: only a.
+	m = build()
+	if got := m.deleteSet(false); !reflect.DeepEqual(got, []string{"a"}) {
+		t.Errorf("deleteSet(false) = %v, want [a]", got)
+	}
+	mm, cmd = m.Update(keyRune('n'))
+	if cmd == nil {
+		t.Fatal("n produced no command")
+	}
+	if got := mm.(Model); got.state != statePackageDeleting {
+		t.Errorf("n left state %v, want deleting", got.state)
+	}
+
+	// esc: back to the list, relation cleared, nothing deleted.
+	m = build()
+	mm, cmd = m.Update(tea.KeyMsg{Type: tea.KeyEsc})
+	m = mm.(Model)
+	if cmd != nil {
+		t.Error("esc produced a command")
+	}
+	if m.state != statePackageList {
+		t.Errorf("esc left state %v, want the package list", m.state)
+	}
+	if !m.rel.Empty() {
+		t.Errorf("esc kept relation %+v", m.rel)
+	}
+}
+
+// TestLeavingPackageViewDropsGraph stops the dependency panel from pairing one
+// environment's relations with another environment's package list.
+func TestLeavingPackageViewDropsGraph(t *testing.T) {
+	m := relModel([]string{"a", "b"}, map[string][]string{"a": {"b"}}, "a")
+	m.deps, m.dependents = map[string][]string{"a": {"b"}}, map[string][]string{"b": {"a"}}
+
+	for _, k := range []string{"esc", "q"} {
+		got := m
+		if k == "esc" {
+			mm, _ := got.Update(tea.KeyMsg{Type: tea.KeyEsc})
+			got = mm.(Model)
+		} else {
+			got = runKey(got, keyRune('q'))
+		}
+		if got.state != stateList {
+			t.Fatalf("%q left state %v, want the environment list", k, got.state)
+		}
+		if got.deps != nil || got.dependents != nil {
+			t.Errorf("%q kept the dependency graph", k)
+		}
+		if !got.rel.Empty() {
+			t.Errorf("%q kept relation %+v", k, got.rel)
+		}
+	}
+}
+
+// TestDeleteConfirmFitsTerminalAndKeepsHints pins the invariant that matters
+// most in this dialog: whatever the terminal size and however long the lists,
+// the box fits and the key legend survives. Chrome clipping the hints off the
+// bottom would leave the user in a dialog with no visible way out.
+func TestDeleteConfirmFitsTerminalAndKeepsHints(t *testing.T) {
+	// A graph big enough to overflow any terminal under test.
+	packages := mkPkgs(120)
+	edges := map[string][]string{}
+	for i := 1; i < len(packages); i++ {
+		edges[packages[i]] = []string{packages[0]}
+	}
+
+	for _, h := range []int{8, 10, 14, 16, 17, 18, 24, 40} {
+		for _, w := range []int{50, 80, 120, 200} {
+			for _, sel := range [][]string{
+				{packages[0]},         // both groups: 119 breaks, 0 orphans
+				{packages[1]},         // one break, no orphans
+				{packages[0], "nope"}, // a selection that is not in the list
+			} {
+				m := relModel(packages, edges, sel...)
+				m.width, m.height = w, h
+				m = runKey(m, keyRune('d'))
+
+				got := m.viewPackageDeleteConfirm()
+				if n := lipgloss.Height(got); n > h {
+					t.Fatalf("w=%d h=%d sel=%v: dialog is %d lines", w, h, sel, n)
+				}
+				// The legend must be present even when the lists had to go.
+				for _, hint := range []string{"esc"} {
+					if !strings.Contains(got, hint) {
+						t.Fatalf("w=%d h=%d sel=%v: dialog lost the %q hint:\n%s", w, h, sel, hint, got)
+					}
+				}
+			}
+		}
+	}
+}
+
+// TestNameLinesFoldsAndFits covers the list packing directly: lines stay within
+// the width, the row cap is honoured, and what is dropped is counted.
+func TestNameLinesFoldsAndFits(t *testing.T) {
+	names := mkPkgs(40) // pkg0 .. pkg39, so ", " separated names all differ
+
+	for _, width := range []int{10, 20, 41, 200} {
+		for _, maxRows := range []int{1, 2, 5, 100} {
+			lines := nameLines(names, width, maxRows)
+			if len(lines) > maxRows {
+				t.Errorf("width=%d rows=%d: got %d lines", width, maxRows, len(lines))
+			}
+			for _, l := range lines {
+				if n := len([]rune(l)); n > width {
+					t.Errorf("width=%d rows=%d: line %q is %d runes", width, maxRows, l, n)
+				}
+			}
+			// The invariant that matters: nothing is dropped silently. If a name
+			// is missing the output has to say how many more there are.
+			joined := strings.Join(lines, ", ")
+			dropped := 0
+			for _, n := range names {
+				if !strings.Contains(joined, n) {
+					dropped++
+				}
+			}
+			if dropped > 0 && !strings.Contains(joined, "more") {
+				t.Errorf("width=%d rows=%d: %d names dropped with no count: %q",
+					width, maxRows, dropped, joined)
+			}
+		}
+	}
+
+	if got := nameLines(nil, 40, 3); got != nil {
+		t.Errorf("nameLines(nil) = %v, want nil", got)
+	}
+	if got := nameLines(names, 0, 3); got != nil {
+		t.Errorf("nameLines(width=0) = %v, want nil", got)
+	}
+}
+
+// TestDepSectionHonoursBudget covers the panel's row arithmetic: a section
+// must never emit more lines than it was given, or lipgloss clips the section
+// below it and the panel silently loses content.
+func TestDepSectionHonoursBudget(t *testing.T) {
+	for _, n := range []int{0, 1, 3, 40} {
+		names := mkPkgs(n)
+		for _, maxLines := range []int{1, 2, 3, 10} {
+			for _, width := range []int{10, 30} {
+				lines := depSection("needs", names, maxLines, width)
+				if len(lines) > maxLines {
+					t.Errorf("n=%d maxLines=%d width=%d: %d lines: %q",
+						n, maxLines, width, len(lines), lines)
+				}
+				for _, l := range lines {
+					if w := lipgloss.Width(l); w > width {
+						t.Errorf("n=%d maxLines=%d width=%d: line is %d wide: %q",
+							n, maxLines, width, w, l)
+					}
+				}
+				// Whether or not the names fit, the header has to state how
+				// many there are — that is what keeps a cut list honest.
+				joined := strings.Join(lines, " ")
+				if !strings.Contains(joined, fmt.Sprintf("(%d)", n)) {
+					t.Errorf("n=%d maxLines=%d width=%d: header lost the count: %q",
+						n, maxLines, width, joined)
+				}
+				// And anything cut short has to say so.
+				shown := 0
+				for _, name := range names {
+					if strings.Contains(joined, name) {
+						shown++
+					}
+				}
+				if shown < n && maxLines > 1 && !strings.Contains(joined, "more") {
+					t.Errorf("n=%d maxLines=%d width=%d: %d of %d shown with no count: %q",
+						n, maxLines, width, shown, n, joined)
+				}
+			}
+		}
+	}
+}
+
+func contains(haystack []string, needle string) bool {
+	for _, s := range haystack {
+		if s == needle {
+			return true
+		}
+	}
+	return false
+}
+
+func dedupe(in []string) []string {
+	seen := make(map[string]bool, len(in))
+	out := make([]string, 0, len(in))
+	for _, s := range in {
+		if !seen[s] {
+			seen[s] = true
+			out = append(out, s)
+		}
+	}
+	return out
 }
 
 func keyRune(r rune) tea.KeyMsg {

@@ -6,6 +6,7 @@ import (
 	"os/exec"
 	"path/filepath"
 	"runtime"
+	"sort"
 	"strings"
 
 	"github.com/charmbracelet/bubbles/key"
@@ -66,9 +67,16 @@ type packagesLoadedMsg struct {
 	envType string
 	idx     int
 	pkgs    []string
-	err     error
+	// deps[p] is what p needs, dependents[p] is what needs p. Both are keyed by
+	// the names in pkgs. A nil map means the graph could not be built.
+	deps       map[string][]string
+	dependents map[string][]string
+	err        error
 }
-type packageDeletedMsg struct{ err error }
+type packageDeletedMsg struct {
+	count int
+	err   error
+}
 
 type Model struct {
 	state     appState
@@ -100,6 +108,15 @@ type Model struct {
 	pkgCursor   int
 	pkgSelected map[int]bool
 	pkgLoaded   bool
+
+	// dependency graph of the environment being browsed
+	deps       map[string][]string
+	dependents map[string][]string
+
+	// how the current selection connects to the rest of the environment;
+	// computed when the delete confirmation opens so the dialog and the delete
+	// command agree on the same set.
+	rel relation
 }
 
 func New() Model {
@@ -179,36 +196,177 @@ func deleteEnvCmd(item listItem, cenvs []conda.Env, uenvs []uv.Env) tea.Cmd {
 
 func loadPackagesCmd(envType string, idx int, cenvs []conda.Env, uenvs []uv.Env) tea.Cmd {
 	return func() tea.Msg {
-		var pkgs []string
-		var err error
-		if envType == "conda" && idx < len(cenvs) {
-			pkgs, err = conda.ListPackages(cenvs[idx])
-		} else if envType == "uv" && idx < len(uenvs) {
-			pkgs, err = uv.ListPackages(uenvs[idx])
+		msg := packagesLoadedMsg{envType: envType, idx: idx}
+		switch {
+		case envType == "conda" && idx < len(cenvs):
+			msg.pkgs, msg.err = conda.ListPackages(cenvs[idx])
+			if msg.err == nil {
+				// The graph is a nicety: if it cannot be built the list still
+				// works, it just shows no relations.
+				msg.deps, msg.dependents, _ = conda.Dependencies(cenvs[idx])
+			}
+		case envType == "uv" && idx < len(uenvs):
+			msg.pkgs, msg.err = uv.ListPackages(uenvs[idx])
+			if msg.err == nil {
+				msg.deps, msg.dependents, _ = uv.Dependencies(uenvs[idx])
+			}
 		}
-		return packagesLoadedMsg{envType: envType, idx: idx, pkgs: pkgs, err: err}
+		return msg
 	}
 }
 
-func deletePackagesCmd(envType string, idx int, cenvs []conda.Env, uenvs []uv.Env, selected map[int]bool, pkgs []string) tea.Cmd {
+// deletePackagesCmd removes exactly the named packages. The caller decides
+// whether that set includes the related packages, so there is a single place
+// where the user's choice is applied.
+func deletePackagesCmd(envType string, idx int, cenvs []conda.Env, uenvs []uv.Env, names []string) tea.Cmd {
 	return func() tea.Msg {
-		var toDelete []string
-		for i, name := range pkgs {
-			if selected[i] {
-				toDelete = append(toDelete, name)
-			}
-		}
-		if len(toDelete) == 0 {
+		if len(names) == 0 {
 			return packageDeletedMsg{err: fmt.Errorf("no packages selected")}
 		}
-		var err error
-		if envType == "conda" && idx < len(cenvs) {
-			err = conda.RemovePackage(cenvs[idx], toDelete...)
-		} else if envType == "uv" && idx < len(uenvs) {
-			err = uv.RemovePackage(uenvs[idx], toDelete...)
+		var (
+			count int
+			err   error
+		)
+		switch {
+		case envType == "conda" && idx < len(cenvs):
+			count, err = conda.RemovePackage(cenvs[idx], names...)
+		case envType == "uv" && idx < len(uenvs):
+			count, err = uv.RemovePackage(uenvs[idx], names...)
+		default:
+			err = fmt.Errorf("environment is no longer in the list")
 		}
-		return packageDeletedMsg{err: err}
+		return packageDeletedMsg{count: count, err: err}
 	}
+}
+
+// selectedNames returns the ticked package names in list order.
+func (m Model) selectedNames() []string {
+	names := make([]string, 0, len(m.pkgSelected))
+	for i, name := range m.packages {
+		if m.pkgSelected[i] {
+			names = append(names, name)
+		}
+	}
+	return names
+}
+
+// relation describes how the current selection connects to the rest of the
+// environment, in both directions.
+type relation struct {
+	// Breaks holds the transitive dependents of the selection: packages that
+	// would be left with a requirement nothing satisfies.
+	Breaks []string
+	// Orphans holds the selection's own dependencies that nothing else in the
+	// environment needs, so they would be left unused.
+	Orphans []string
+}
+
+// Empty reports whether the selection is connected to nothing else.
+func (r relation) Empty() bool { return len(r.Breaks) == 0 && len(r.Orphans) == 0 }
+
+// All returns every package the relation names, for use as the delete set.
+func (r relation) All() []string {
+	out := make([]string, 0, len(r.Breaks)+len(r.Orphans))
+	seen := make(map[string]bool, cap(out))
+	for _, group := range [][]string{r.Breaks, r.Orphans} {
+		for _, n := range group {
+			if !seen[n] {
+				seen[n] = true
+				out = append(out, n)
+			}
+		}
+	}
+	sort.Strings(out)
+	return out
+}
+
+// deleteSet is the package list the confirmation dialog would submit: what was
+// ticked, plus — when the user asked for them — every related package.
+func (m Model) deleteSet(includeRelated bool) []string {
+	names := m.selectedNames()
+	if includeRelated {
+		names = append(names, m.rel.All()...)
+	}
+	return names
+}
+
+// selectionRelation analyses the ticked packages against the dependency graph.
+func (m Model) selectionRelation() relation {
+	selected := make(map[string]bool, len(m.pkgSelected))
+	for i, name := range m.packages {
+		if m.pkgSelected[i] {
+			selected[name] = true
+		}
+	}
+	if len(selected) == 0 {
+		return relation{}
+	}
+
+	installed := make(map[string]bool, len(m.packages))
+	for _, name := range m.packages {
+		installed[name] = true
+	}
+
+	// Walk the reverse edges transitively: whatever needs something in the
+	// selection, and whatever needs that, and so on.
+	breaks := make(map[string]bool)
+	queue := make([]string, 0, len(selected))
+	for n := range selected {
+		queue = append(queue, n)
+	}
+	for len(queue) > 0 {
+		n := queue[0]
+		queue = queue[1:]
+		for _, d := range m.dependents[n] {
+			// A dependent that is going away anyway does not break, and the
+			// visited set also stops dependency cycles from looping forever.
+			if selected[d] || breaks[d] || !installed[d] {
+				continue
+			}
+			breaks[d] = true
+			queue = append(queue, d)
+		}
+	}
+
+	// A package is orphaned when the selection needs it and nothing that stays
+	// behind does. Removing an orphan can orphan its own dependencies, so this
+	// runs to a fixpoint. A package the selection does not reach is left alone:
+	// it is something the user installed deliberately, not leftover.
+	orphans := make(map[string]bool)
+	for changed := true; changed; {
+		changed = false
+		for _, pkg := range m.packages {
+			if selected[pkg] || orphans[pkg] {
+				continue
+			}
+			reachedByDoomed, allDependentsDoomed := false, true
+			for _, d := range m.dependents[pkg] {
+				if !installed[d] {
+					continue
+				}
+				if selected[d] || orphans[d] {
+					reachedByDoomed = true
+				} else {
+					allDependentsDoomed = false
+				}
+			}
+			if reachedByDoomed && allDependentsDoomed {
+				orphans[pkg] = true
+				changed = true
+			}
+		}
+	}
+
+	return relation{Breaks: sortedKeys(breaks), Orphans: sortedKeys(orphans)}
+}
+
+func sortedKeys(set map[string]bool) []string {
+	out := make([]string, 0, len(set))
+	for n := range set {
+		out = append(out, n)
+	}
+	sort.Strings(out)
+	return out
 }
 
 // ── update ────────────────────────────────────────────────────────────────────
@@ -300,6 +458,10 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			// point past the end.
 			m.clampPkgCursor()
 			m.pkgLoaded = true
+			// The graph is keyed by these very package names, so it is stored
+			// only alongside the list it was built from: a load resolving for an
+			// environment the user has already left must not repoint the panel.
+			m.deps, m.dependents = msg.deps, msg.dependents
 		}
 		return m, nil
 
@@ -309,12 +471,14 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			m.statusErr = true
 			m.state = statePackageList
 		} else {
-			count := len(m.pkgSelected)
-			m.statusMsg = fmt.Sprintf("Deleted %d package(s).", count)
+			// conda's solver removes more than it was asked to, so report what
+			// actually happened rather than what was requested.
+			m.statusMsg = fmt.Sprintf("Deleted %d package(s).", msg.count)
 			m.statusErr = false
 			m.pkgSelected = make(map[int]bool)
 			m.pkgCursor = 0
 			m.pkgLoaded = false
+			m.rel = relation{}
 			m.state = statePackageList
 			// refresh packages and env details
 			if m.pkgEnvType == "conda" && m.pkgIdx < len(m.condaEnvs) {
@@ -398,6 +562,10 @@ func (m Model) handleKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 			m.state = stateList
 			m.packages = nil
 			m.pkgSelected = nil
+			// The graph belongs to the environment being left; keeping it would
+			// let the next environment's list show stale relations.
+			m.deps, m.dependents = nil, nil
+			m.rel = relation{}
 			m.pkgLoaded = false
 			return m, nil
 
@@ -462,6 +630,9 @@ func (m Model) handleKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 				m.statusErr = true
 				return m, nil
 			}
+			// Freeze the analysis now: the dialog and the command must both act
+			// on the same set even if a refresh lands in between.
+			m.rel = m.selectionRelation()
 			m.state = statePackageDeleteConfirm
 			return m, nil
 		}
@@ -476,10 +647,16 @@ func (m Model) handleKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 		}
 		switch {
 		case key.Matches(msg, keys.Confirm):
+			// y: the selection plus everything the analysis flagged with it.
 			m.state = statePackageDeleting
-			return m, deletePackagesCmd(m.pkgEnvType, m.pkgIdx, m.condaEnvs, m.uvEnvs, m.pkgSelected, m.packages)
-		case key.Matches(msg, keys.Cancel) || msg.String() == "n":
+			return m, deletePackagesCmd(m.pkgEnvType, m.pkgIdx, m.condaEnvs, m.uvEnvs, m.deleteSet(true))
+		case msg.String() == "n":
+			// n: only what was ticked, leaving the rest as it falls.
+			m.state = statePackageDeleting
+			return m, deletePackagesCmd(m.pkgEnvType, m.pkgIdx, m.condaEnvs, m.uvEnvs, m.deleteSet(false))
+		case key.Matches(msg, keys.Cancel):
 			m.state = statePackageList
+			m.rel = relation{}
 		}
 		return m, nil
 
@@ -525,6 +702,10 @@ func (m Model) handleKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 			m.pkgSelected = make(map[int]bool)
 			m.pkgCursor = 0
 			m.pkgLoaded = false
+			// Drop the previous environment's graph so the panel cannot pair its
+			// relations with this environment's list while the load is in flight.
+			m.deps, m.dependents = nil, nil
+			m.rel = relation{}
 			m.statusMsg = ""
 			m.state = statePackageList
 			return m, loadPackagesCmd(sel.envType, sel.idx, m.condaEnvs, m.uvEnvs)
@@ -813,6 +994,11 @@ func (m Model) pkgEnvName() string {
 // hint and the optional status lines) adds a variable number of rows, so the
 // height is measured rather than assumed.
 func (m Model) viewPackages() string {
+	// Two columns need room for both; below that the list gets the whole width.
+	if len(m.packages) > 0 && m.width >= 72 {
+		return m.viewPackagesTwoColumn()
+	}
+
 	maxRows := len(m.packages)
 	if maxRows < 1 {
 		maxRows = 1
@@ -830,6 +1016,204 @@ func (m Model) viewPackages() string {
 	// On a very short terminal even the chrome does not fit; clip rather than
 	// write a panel taller than the screen.
 	return lipgloss.Place(m.width, m.height, lipgloss.Center, lipgloss.Center, clipHeight(box, m.height))
+}
+
+// viewPackagesTwoColumn shows the package list beside the highlighted package's
+// relations, mirroring the environment view's list/detail split.
+func (m Model) viewPackagesTwoColumn() string {
+	leftW := (m.width - 3) * 2 / 5
+	if leftW < 30 {
+		leftW = 30
+	}
+	if leftW > 56 {
+		leftW = 56
+	}
+	rightW := m.width - leftW - 3
+	panelH := m.height - 3
+
+	cols := lipgloss.JoinHorizontal(lipgloss.Top,
+		m.renderPackageList(leftW, panelH), " ", m.renderDepPanel(rightW, panelH))
+	status := clipHeight(m.renderPackageStatusBar(), 1)
+	return lipgloss.JoinVertical(lipgloss.Left, cols, status)
+}
+
+func (m Model) renderPackageList(w, h int) string {
+	innerW, innerH := w-2, h-2
+
+	// title, its blank line, and the footer
+	maxRows := innerH - 3
+	if maxRows < 1 {
+		maxRows = 1
+	}
+
+	var sb strings.Builder
+	title := fmt.Sprintf("%s  %d packages", m.pkgEnvName(), len(m.packages))
+	sb.WriteString(detailTitleStyle.Render(truncate(title, innerW)) + "\n\n")
+
+	start := 0
+	if m.pkgCursor >= maxRows {
+		start = m.pkgCursor - maxRows + 1
+	}
+	end := start + maxRows
+	if end > len(m.packages) {
+		end = len(m.packages)
+	}
+
+	for i := start; i < end; i++ {
+		mark := "[ ]"
+		if m.pkgSelected[i] {
+			mark = "[x]"
+		}
+		line := truncate(fmt.Sprintf("%s %s", mark, m.packages[i]), innerW)
+		switch {
+		case i == m.pkgCursor:
+			line = selectedItemStyle.Render(" " + line)
+		case m.pkgSelected[i]:
+			line = successStyle.Render("  " + line)
+		default:
+			line = itemStyle.Render(line)
+		}
+		sb.WriteString(line + "\n")
+	}
+
+	var footer string
+	if len(m.packages) > maxRows {
+		footer = fmt.Sprintf("%d-%d of %d", start+1, end, len(m.packages))
+	}
+	if n := len(m.pkgSelected); n > 0 {
+		if footer != "" {
+			footer += "  "
+		}
+		footer += fmt.Sprintf("%d selected", n)
+	}
+	sb.WriteString(statusBarStyle.Render(truncate("  "+footer, innerW)))
+
+	return panelActiveStyle.Width(innerW).Height(innerH).Render(sb.String())
+}
+
+// renderDepPanel lists what the highlighted package needs and what needs it.
+// Only packages present in the environment are shown, since those are the only
+// ones a delete could act on.
+func (m Model) renderDepPanel(w, h int) string {
+	innerW, innerH := w-2, h-2
+	if innerW < 8 || innerH < 4 {
+		return panelStyle.Width(max(innerW, 1)).Height(max(innerH, 1)).Render("")
+	}
+	if m.pkgCursor < 0 || m.pkgCursor >= len(m.packages) {
+		return panelStyle.Width(innerW).Height(innerH).Render("")
+	}
+
+	name := m.packages[m.pkgCursor]
+
+	var sb strings.Builder
+	sb.WriteString(detailTitleStyle.Render(truncate(name, innerW)) + "\n\n")
+
+	if m.deps == nil && m.dependents == nil {
+		sb.WriteString(statusBarStyle.Render("  dependency data unavailable"))
+		return panelStyle.Width(innerW).Height(innerH).Render(sb.String())
+	}
+
+	needs := m.installedOnly(m.deps[name])
+	usedBy := m.installedOnly(m.dependents[name])
+
+	// The title, its blank line and the blank between the sections are already
+	// spent; the sections divide what is left, each counting its own header.
+	lines := max(innerH-3, 2)
+	needLines, usedLines := (lines+1)/2, lines/2
+	switch {
+	case len(needs) == 0 && len(usedBy) == 0:
+		needLines, usedLines = 1, 1
+	case len(needs) == 0:
+		needLines, usedLines = 1, lines-1
+	case len(usedBy) == 0:
+		needLines, usedLines = lines-1, 1
+	}
+
+	out := depSection("needs", needs, needLines, innerW)
+	out = append(out, "")
+	out = append(out, depSection("needed by", usedBy, usedLines, innerW)...)
+
+	return panelStyle.Width(innerW).Height(innerH).Render(strings.Join(out, "\n"))
+}
+
+// depSection renders one titled group of package names, marking any that did
+// not fit. maxLines is the total the section may occupy, header included, so
+// the caller can budget rows exactly rather than leaving them to be clipped.
+func depSection(title string, names []string, maxLines, width int) []string {
+	maxLines = max(maxLines, 1)
+	// The header states the true total, which is what keeps a list cut to a
+	// single line honest. The style indents it by one column, so the text has
+	// one column less than the budget, and the title gives way before the
+	// count: a clipped number reads as a smaller, wrong one.
+	room := width - 1
+	suffix := fmt.Sprintf(" (%d)", len(names))
+	header := truncate(truncate(title, max(room-len([]rune(suffix)), 0))+suffix, room)
+	lines := []string{sectionHeaderStyle.Render(header)}
+	if maxLines == 1 {
+		return lines
+	}
+	if len(names) == 0 {
+		return append(lines, statusBarStyle.Render("  -"))
+	}
+
+	// A truncated list needs a line for the count of what did not fit.
+	show := len(names)
+	if room := maxLines - 1; show > room {
+		show = room - 1
+	}
+	shown := 0
+	for _, n := range names {
+		if shown == show {
+			break
+		}
+		lines = append(lines, itemStyle.Render(truncate(n, width-2)))
+		shown++
+	}
+	if rest := len(names) - shown; rest > 0 {
+		lines = append(lines, statusBarStyle.Render(fmt.Sprintf("  +%d more", rest)))
+	}
+	return lines
+}
+
+// installedOnly drops names absent from the current list.
+func (m Model) installedOnly(names []string) []string {
+	if len(names) == 0 {
+		return nil
+	}
+	installed := make(map[string]bool, len(m.packages))
+	for _, n := range m.packages {
+		installed[n] = true
+	}
+	out := make([]string, 0, len(names))
+	for _, n := range names {
+		if installed[n] {
+			out = append(out, n)
+		}
+	}
+	return out
+}
+
+// truncate shortens s to at most w runes, marking the cut with an ellipsis.
+// It runs before styling, so plain rune arithmetic is enough.
+func truncate(s string, w int) string {
+	if w <= 0 {
+		return ""
+	}
+	r := []rune(s)
+	if len(r) <= w {
+		return s
+	}
+	if w == 1 {
+		return string(r[:1])
+	}
+	return string(r[:w-1]) + "…"
+}
+
+func max(a, b int) int {
+	if a > b {
+		return a
+	}
+	return b
 }
 
 // clipHeight drops trailing lines so s is at most h lines tall.
@@ -922,27 +1306,168 @@ func (m Model) renderPackagesBox(maxRows int) string {
 }
 
 func (m Model) viewPackageDeleteConfirm() string {
-	var names []string
-	for i, name := range m.packages {
-		if m.pkgSelected[i] {
-			names = append(names, name)
+	names := m.selectedNames()
+
+	// Below this a terminal cannot show the lists and the decision together.
+	// The dialog collapses to the decision alone, because the alternative is
+	// chrome clipping the key hints off the bottom — leaving the user in a
+	// dialog with no visible way out of it.
+	if m.height < deleteDialogFullHeight {
+		return m.viewPackageDeleteCompact(names)
+	}
+
+	// The box width drives how much of a package name fits on a line, and the
+	// terminal height how many lines the name lists may take. The chrome cost
+	// is fixed and known, so the budget is arithmetic rather than a guess and
+	// clipHeight never has to fire.
+	boxW := min(76, max(40, m.width-4))
+	innerW := boxW - 6
+	rows := max(1, m.height-deleteDialogChrome)
+
+	var sb strings.Builder
+	sb.WriteString(confirmStyle.Render(fmt.Sprintf("Delete %d package(s) from ", len(names))) +
+		dangerStyle.Render(m.pkgEnvName()) +
+		confirmStyle.Render("?") + "\n\n")
+	// The selection itself only needs enough rows to recognise it.
+	sb.WriteString(linesBlock(nameLines(names, innerW, min(3, rows))) + "\n")
+
+	if m.rel.Empty() {
+		sb.WriteString("\n" + statusBarStyle.Render("No other installed package is connected to this selection.") + "\n")
+	} else {
+		// Share what is left between the two groups when both are present. The
+		// broken dependents outrank the orphans, so they take the odd row.
+		breakRows, orphanRows := rows, 0
+		if len(m.rel.Breaks) > 0 && len(m.rel.Orphans) > 0 {
+			breakRows, orphanRows = rows-rows/2, rows/2
+		}
+
+		sb.WriteString("\n")
+		if n := len(m.rel.Breaks); n > 0 {
+			sb.WriteString(dangerStyle.Render(fmt.Sprintf("%d package(s) depend on what you selected", n)) +
+				statusBarStyle.Render(" and would be left broken:") + "\n")
+			if breakRows > 0 {
+				sb.WriteString(linesBlock(nameLines(m.rel.Breaks, innerW, breakRows)) + "\n")
+			}
+		}
+		if n := len(m.rel.Orphans); n > 0 {
+			sb.WriteString(confirmStyle.Render(fmt.Sprintf("%d package(s)", n)) +
+				statusBarStyle.Render(" are only needed by your selection and would be left unused:") + "\n")
+			if orphanRows > 0 {
+				sb.WriteString(linesBlock(nameLines(m.rel.Orphans, innerW, orphanRows)) + "\n")
+			}
+		}
+		// conda's solver keeps the environment consistent and so removes more
+		// than it is asked to; the graph above is a lower bound, not a promise.
+		if m.pkgEnvType == "conda" {
+			sb.WriteString("\n" + confirmStyle.Render("note: ") +
+				statusBarStyle.Render("conda may also remove further packages to keep the environment consistent.") + "\n")
 		}
 	}
 
-	preview := strings.Join(names, ", ")
-	if runes := []rune(preview); len(runes) > 60 {
-		preview = string(runes[:57]) + "..."
+	sb.WriteString("\n")
+	sb.WriteString(m.deleteConfirmHints(names))
+
+	box := panelActiveStyle.Width(boxW).Padding(1, 2).Render(sb.String())
+	return lipgloss.Place(m.width, m.height, lipgloss.Center, lipgloss.Center, clipHeight(box, m.height))
+}
+
+// viewPackageDeleteCompact is the dialog for a terminal too short for the
+// package lists: what is at stake, and the keys.
+func (m Model) viewPackageDeleteCompact(names []string) string {
+	var sb strings.Builder
+	sb.WriteString(confirmStyle.Render(fmt.Sprintf("Delete %d package(s) from ", len(names))) +
+		dangerStyle.Render(m.pkgEnvName()) + confirmStyle.Render("?") + "\n")
+	if n := len(m.rel.Breaks); n > 0 {
+		sb.WriteString(dangerStyle.Render(fmt.Sprintf("%d dependent(s) would break", n)) + "\n")
+	}
+	if n := len(m.rel.Orphans); n > 0 {
+		sb.WriteString(confirmStyle.Render(fmt.Sprintf("%d dependency(ies) would be orphaned", n)) + "\n")
+	}
+	sb.WriteString("\n" + m.deleteConfirmHints(names))
+
+	box := panelActiveStyle.Width(min(76, max(40, m.width-4))).Padding(1, 2).Render(sb.String())
+	return lipgloss.Place(m.width, m.height, lipgloss.Center, lipgloss.Center, clipHeight(box, m.height))
+}
+
+// deleteConfirmHints renders the key legend, which both dialog sizes show.
+func (m Model) deleteConfirmHints(names []string) string {
+	if m.rel.Empty() {
+		return keyStyle.Render("y") + " delete  " + keyStyle.Render("esc") + " cancel"
+	}
+	total := len(names) + len(m.rel.All())
+	return keyStyle.Render("y") + fmt.Sprintf(" delete all %d  ", total) +
+		keyStyle.Render("n") + fmt.Sprintf(" only the %d selected  ", len(names)) +
+		keyStyle.Render("esc") + " cancel"
+}
+
+// deleteDialogChrome is the number of rows viewPackageDeleteConfirm spends on
+// everything that is not a package list: border, padding, the heading and its
+// blank line, the selection preview, the group headings, the conda note and the
+// key hints. The two group lists get whatever the terminal has left over.
+const deleteDialogChrome = 15
+
+// deleteDialogFullHeight is the shortest terminal that can show the chrome
+// above plus one row for each group list.
+const deleteDialogFullHeight = 17
+
+// linesBlock renders name lines in the muted style used for secondary text.
+func linesBlock(lines []string) string {
+	if len(lines) == 0 {
+		return statusBarStyle.Render("-")
+	}
+	out := make([]string, len(lines))
+	for i, l := range lines {
+		out[i] = statusBarStyle.Render(l)
+	}
+	return strings.Join(out, "\n")
+}
+
+// nameLines flows names into comma-separated lines of at most width runes. When
+// more than maxRows lines are needed it keeps the first maxRows and folds the
+// count of what is not shown into the last one, so a long list is still
+// recognisable rather than reduced to a truncated stub.
+func nameLines(names []string, width, maxRows int) []string {
+	if len(names) == 0 || maxRows < 1 || width <= 0 {
+		return nil
 	}
 
-	msg := confirmStyle.Render(fmt.Sprintf("Delete %d package(s) from ", len(names))) +
-		dangerStyle.Render(m.pkgEnvName()) +
-		confirmStyle.Render("?") + "\n\n" +
-		statusBarStyle.Render(preview) + "\n\n" +
-		keyStyle.Render("y") + " confirm  " +
-		keyStyle.Render("esc") + " cancel"
+	var lines []string
+	cur, inLine := "", 0
+	for i, n := range names {
+		if inLine > 0 && len([]rune(cur))+2+len([]rune(n)) > width {
+			lines = append(lines, truncate(cur, width))
+			cur, inLine = "", 0
+		}
+		if inLine == 0 {
+			if len(lines) >= maxRows {
+				// The count is the whole point of the last line, so reserve its
+				// room before trimming the names to fit beside it.
+				suffix := fmt.Sprintf(" +%d more", len(names)-i)
+				keep := width - len([]rune(suffix))
+				if keep < 1 {
+					lines[len(lines)-1] = truncate(strings.TrimSpace(suffix), width)
+				} else {
+					lines[len(lines)-1] = truncate(lines[len(lines)-1], keep) + suffix
+				}
+				return lines
+			}
+			cur, inLine = n, 1
+			continue
+		}
+		cur += ", " + n
+		inLine++
+	}
+	if inLine > 0 {
+		lines = append(lines, truncate(cur, width))
+	}
+	return lines
+}
 
-	box := panelActiveStyle.Width(70).Padding(1, 2).Render(msg)
-	return lipgloss.Place(m.width, m.height, lipgloss.Center, lipgloss.Center, box)
+func min(a, b int) int {
+	if a < b {
+		return a
+	}
+	return b
 }
 
 func (m Model) renderStatusBar() string {
@@ -970,6 +1495,24 @@ func (m Model) renderStatusBar() string {
 
 	bar := statusBarStyle.Width(m.width).Render(" pvman  " + hints + status)
 	return bar
+}
+
+// renderPackageStatusBar renders the key hints and status line under the
+// package view.
+func (m Model) renderPackageStatusBar() string {
+	hints := keyStyle.Render("space") + " toggle  " +
+		keyStyle.Render("a") + " all  " +
+		keyStyle.Render("d") + " delete  " +
+		keyStyle.Render("esc") + " back"
+
+	var status string
+	switch {
+	case m.statusMsg != "" && m.statusErr:
+		status = errorStyle.Render("  " + m.statusMsg)
+	case m.statusMsg != "":
+		status = successStyle.Render("  " + m.statusMsg)
+	}
+	return statusBarStyle.Width(m.width).Render(" " + hints + status)
 }
 
 // ── helpers ───────────────────────────────────────────────────────────────────

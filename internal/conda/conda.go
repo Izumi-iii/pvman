@@ -160,6 +160,116 @@ type pkgInfo struct {
 	Channel string `json:"channel"`
 }
 
+// pkgMeta mirrors the subset of a conda-meta/*.json file we care about.
+type pkgMeta struct {
+	Name    string   `json:"name"`
+	Depends []string `json:"depends"`
+}
+
+// Dependencies returns both directions of an environment's dependency relation,
+// keyed by the same names ListPackages reports.
+//
+// deps[p] is what p needs; dependents[p] is what needs p. Only edges between
+// installed packages are kept, so a dependency on something that is not present
+// never shows up as an actionable entry.
+func Dependencies(env Env) (deps, dependents map[string][]string, err error) {
+	metas, err := readCondaMeta(env)
+	if err != nil {
+		return nil, nil, err
+	}
+
+	installed := make(map[string]bool, len(metas))
+	for _, m := range metas {
+		installed[m.Name] = true
+	}
+
+	deps = make(map[string][]string, len(metas))
+	for _, m := range metas {
+		var names []string
+		for _, spec := range m.Depends {
+			n := depName(spec)
+			// Virtual packages ("__win", "__glibc") are not real packages, and
+			// an edge to something absent cannot be acted on.
+			if n == "" || strings.HasPrefix(n, "__") || !installed[n] {
+				continue
+			}
+			names = append(names, n)
+		}
+		deps[m.Name] = dedupeSorted(names)
+	}
+	return deps, invert(deps), nil
+}
+
+// readCondaMeta loads every package record in the environment's conda-meta
+// directory. Unreadable or malformed records are skipped rather than failing
+// the whole listing.
+func readCondaMeta(env Env) ([]pkgMeta, error) {
+	metaDir := filepath.Join(env.Path, "conda-meta")
+	entries, err := os.ReadDir(metaDir)
+	if err != nil {
+		return nil, err
+	}
+
+	metas := make([]pkgMeta, 0, len(entries))
+	for _, e := range entries {
+		if e.IsDir() || !strings.HasSuffix(e.Name(), ".json") {
+			continue
+		}
+		raw, err := os.ReadFile(filepath.Join(metaDir, e.Name()))
+		if err != nil {
+			continue
+		}
+		var m pkgMeta
+		if json.Unmarshal(raw, &m) != nil || m.Name == "" {
+			continue
+		}
+		metas = append(metas, m)
+	}
+	return metas, nil
+}
+
+// depName extracts the package name from a conda dependency spec such as
+// "certifi >=2017.4.17" or "python >=3.12,<3.13.0a0". Hyphens and dots are part
+// of a conda name, so only a version constraint or whitespace ends it.
+func depName(spec string) string {
+	s := strings.TrimSpace(spec)
+	if s == "" {
+		return ""
+	}
+	if i := strings.IndexAny(s, " \t,<>=!|"); i >= 0 {
+		return s[:i]
+	}
+	return s
+}
+
+// invert turns "depends on" into "is depended on by".
+func invert(deps map[string][]string) map[string][]string {
+	out := make(map[string][]string, len(deps))
+	for pkg, names := range deps {
+		for _, n := range names {
+			out[n] = append(out[n], pkg)
+		}
+	}
+	for k, v := range out {
+		out[k] = dedupeSorted(v)
+	}
+	return out
+}
+
+func dedupeSorted(in []string) []string {
+	seen := make(map[string]bool, len(in))
+	out := make([]string, 0, len(in))
+	for _, n := range in {
+		if n == "" || seen[n] {
+			continue
+		}
+		seen[n] = true
+		out = append(out, n)
+	}
+	sort.Strings(out)
+	return out
+}
+
 func listPkgInfo(env Env) ([]pkgInfo, error) {
 	// Address the environment by path: it is always unambiguous, whereas the
 	// name derived from the directory can be wrong (notably for base).
@@ -204,15 +314,22 @@ func ListPackages(env Env) ([]string, error) {
 	return names, nil
 }
 
-// RemovePackage removes packages from a conda environment.
+// RemovePackage removes packages from a conda environment and reports how many
+// actually went away.
 //
 // Packages installed from the "pypi" channel were put there by pip, and
 // `conda remove` cannot touch them, so they are uninstalled with the
 // environment's own pip instead. Everything else goes through conda.
-func RemovePackage(env Env, pkgs ...string) error {
+//
+// The count is read back from conda's own transaction summary because its
+// solver removes far more than it is asked to: dropping one package that a
+// metapackage depends on can take hundreds with it, so len(pkgs) would be a
+// serious understatement.
+func RemovePackage(env Env, pkgs ...string) (int, error) {
 	if len(pkgs) == 0 {
-		return nil
+		return 0, nil
 	}
+	removed := 0
 
 	channelOf := make(map[string]string, len(pkgs))
 	if info, err := listPkgInfo(env); err == nil {
@@ -235,8 +352,14 @@ func RemovePackage(env Env, pkgs ...string) error {
 
 	if len(condaPkgs) > 0 {
 		args := append([]string{"remove", "-p", env.Path, "-y"}, condaPkgs...)
-		if out, err := exec.Command("conda", args...).CombinedOutput(); err != nil {
-			return fmt.Errorf("%v: %s", err, firstLine(out))
+		out, err := exec.Command("conda", args...).CombinedOutput()
+		if err != nil {
+			return removed, fmt.Errorf("%v: %s", err, firstLine(out))
+		}
+		if n := removedCount(out); n > 0 {
+			removed += n
+		} else {
+			removed += len(condaPkgs)
 		}
 	}
 
@@ -244,11 +367,35 @@ func RemovePackage(env Env, pkgs ...string) error {
 		// -y so pip never blocks waiting for a confirmation prompt.
 		args := append([]string{"-m", "pip", "uninstall", "-y"}, pipPkgs...)
 		if out, err := exec.Command(pythonBinary(env.Path), args...).CombinedOutput(); err != nil {
-			return fmt.Errorf("%v: %s", err, firstLine(out))
+			return removed, fmt.Errorf("%v: %s", err, firstLine(out))
 		}
+		// pip uninstalls exactly what it is given; it does not cascade.
+		removed += len(pipPkgs)
 	}
 
-	return nil
+	return removed, nil
+}
+
+// removedCount reads the size of the "will be REMOVED" section of conda's
+// transaction summary. It returns 0 when the summary is not present, so callers
+// can fall back to the requested count.
+func removedCount(out []byte) int {
+	inSection := false
+	count := 0
+	for _, line := range strings.Split(string(out), "\n") {
+		if strings.Contains(line, "will be REMOVED") {
+			inSection = true
+			continue
+		}
+		if strings.HasPrefix(line, "The following packages") {
+			inSection = false
+			continue
+		}
+		if inSection && strings.TrimSpace(line) != "" {
+			count++
+		}
+	}
+	return count
 }
 
 // firstLine keeps CLI error output to one readable line for the status bar.

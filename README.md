@@ -26,6 +26,8 @@
 - Scan current directory for **uv** virtual environments (`.venv` and named envs)
 - Async detail loading — size and package info loads in the background
 - Browse installed packages and remove them, one at a time or in bulk
+- Live dependency panel — highlight a package to see what it needs and what needs it
+- Cascade-aware removal: the delete dialog lists the packages your selection would break or orphan, and lets you take them along
 - Create new uv venvs with a specific Python version
 - Delete conda or uv environments with confirmation
 - Activate an environment in a new shell with a single keystroke
@@ -151,6 +153,35 @@ Press `esc` to go back to the environment list.
 | `a` | Select all (press again to clear) |
 | `d` | Delete all ticked packages (asks for confirmation) |
 | `esc` / `q` / `p` | Back to the environment list |
+
+The panel on the right follows the cursor and shows the highlighted package's
+dependencies in both directions: **needs** (what it requires) and **needed by**
+(what requires it). When the list is too narrow for two columns it falls back to
+a single centred panel.
+
+`d` opens a confirmation that names the packages the selection is entangled
+with, split into two groups:
+
+- **broken** — packages that would be left with a requirement nothing
+  satisfies. These are found by walking the reverse dependency edges
+  transitively.
+- **orphaned** — the selection's own dependencies that nothing else in the
+  environment needs, so they would be left unused. This is transitive too:
+  removing an orphan can orphan its own dependencies. A package the selection
+  does not reach is never listed, so something you installed deliberately stays
+  put.
+
+| Key | Action |
+|-----|--------|
+| `y` | Delete the ticked packages **and** everything listed |
+| `n` | Delete only the ticked packages, leaving the rest as it falls |
+| `esc` | Cancel, deleting nothing |
+
+Note that **pip and uv do not cascade** — `n` really does leave dependents
+broken. conda's solver, by contrast, removes far more than it is asked to: a
+single package pulled in by a metapackage can take hundreds with it. The status
+line reports the number conda actually removed, read back from its own
+transaction summary, rather than the number you asked for.
 
 `ctrl+c` quits from any view.
 

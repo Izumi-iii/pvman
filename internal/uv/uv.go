@@ -185,17 +185,137 @@ func dedupeSorted(in []string) []string {
 	return out
 }
 
-func RemovePackage(env Env, pkgs ...string) error {
+// depsScript asks the environment's own interpreter for every installed
+// distribution and its declared requirements. importlib.metadata resolves the
+// site-packages layout for us, so no path guessing is needed.
+const depsScript = `import importlib.metadata as md, json, sys
+out = []
+for d in md.distributions():
+    try:
+        name = d.metadata.get("Name") or ""
+        reqs = list(d.requires or [])
+    except Exception:
+        continue
+    if name:
+        out.append({"n": name, "r": reqs})
+sys.stdout.write(json.dumps(out))`
+
+// Dependencies returns both directions of a venv's dependency relation, keyed
+// by the same names ListPackages reports.
+//
+// deps[p] is what p needs; dependents[p] is what needs p. Only edges between
+// installed distributions are kept, so an optional or absent dependency never
+// shows up as an actionable entry.
+func Dependencies(env Env) (deps, dependents map[string][]string, err error) {
+	var stderr bytes.Buffer
+	cmd := exec.Command(pythonBinary(env.Path), "-c", depsScript)
+	cmd.Stderr = &stderr
+	out, err := cmd.Output()
+	if err != nil {
+		return nil, nil, fmt.Errorf("%v: %s", err, firstLine(stderr.Bytes()))
+	}
+
+	var dists []struct {
+		Name     string   `json:"n"`
+		Requires []string `json:"r"`
+	}
+	if err := json.Unmarshal(out, &dists); err != nil {
+		return nil, nil, err
+	}
+
+	// Requirements are written in the PEP 503 spelling, which need not match the
+	// installed distribution's display name, so resolve through an index.
+	display := make(map[string]string, len(dists))
+	for _, d := range dists {
+		if k := normalizeName(d.Name); k != "" {
+			display[k] = d.Name
+		}
+	}
+
+	deps = make(map[string][]string, len(dists))
+	for _, d := range dists {
+		key := display[normalizeName(d.Name)]
+		if key == "" {
+			continue
+		}
+		var names []string
+		for _, req := range d.Requires {
+			n, ok := display[reqName(req)]
+			if !ok {
+				continue // optional, conditional, or not installed
+			}
+			names = append(names, n)
+		}
+		deps[key] = dedupeSorted(names)
+	}
+	return deps, invert(deps), nil
+}
+
+// reqName extracts the distribution name from a Requires-Dist entry such as
+// "numpy (<2.0.0,>=1.17)". Extras are only installed on request, so a
+// requirement guarded by one is not a real dependency of an installed package.
+func reqName(req string) string {
+	if i := strings.IndexByte(req, ';'); i >= 0 {
+		if strings.Contains(req[i:], "extra") {
+			return ""
+		}
+		req = req[:i]
+	}
+	if i := strings.IndexAny(req, " \t([<>=!~"); i >= 0 {
+		req = req[:i]
+	}
+	return normalizeName(req)
+}
+
+// normalizeName applies the PEP 503 name normalisation, so a requirement on
+// "charset_normalizer" matches the installed "charset-normalizer".
+func normalizeName(s string) string {
+	var b strings.Builder
+	dash := false
+	for _, r := range strings.ToLower(strings.TrimSpace(s)) {
+		switch r {
+		case '-', '_', '.':
+			if !dash {
+				b.WriteByte('-')
+				dash = true
+			}
+		default:
+			dash = false
+			b.WriteRune(r)
+		}
+	}
+	return strings.Trim(b.String(), "-")
+}
+
+// invert turns "depends on" into "is depended on by".
+func invert(deps map[string][]string) map[string][]string {
+	out := make(map[string][]string, len(deps))
+	for pkg, names := range deps {
+		for _, n := range names {
+			out[n] = append(out[n], pkg)
+		}
+	}
+	for k, v := range out {
+		out[k] = dedupeSorted(v)
+	}
+	return out
+}
+
+// RemovePackage removes packages from a venv and reports how many went away.
+//
+// Unlike conda, pip and uv uninstall exactly what they are given and leave
+// dependents in place, so the count is simply the number of names passed in.
+func RemovePackage(env Env, pkgs ...string) (int, error) {
 	if len(pkgs) == 0 {
-		return nil
+		return 0, nil
 	}
 	py := pythonBinary(env.Path)
 	args := append([]string{"pip", "uninstall", "--python", py}, pkgs...)
 	// uv does not prompt, but capture stderr so failures are reported usefully.
 	if out, err := exec.Command("uv", args...).CombinedOutput(); err != nil {
-		return fmt.Errorf("%v: %s", err, firstLine(out))
+		return 0, fmt.Errorf("%v: %s", err, firstLine(out))
 	}
-	return nil
+	return len(pkgs), nil
 }
 
 // firstLine keeps CLI error output to one readable line for the status bar.
