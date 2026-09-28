@@ -86,6 +86,12 @@ var (
 			Foreground(colorAmber).
 			Bold(true)
 
+	// filterStatusStyle marks a list that is showing a subset, so the missing
+	// rows read as a choice the user made rather than a failed load.
+	filterStatusStyle = lipgloss.NewStyle().
+				Foreground(colorCondaBlue).
+				Bold(true)
+
 	dangerStyle = lipgloss.NewStyle().
 			Foreground(colorRed).
 			Bold(true)

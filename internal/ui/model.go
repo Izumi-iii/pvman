@@ -117,6 +117,17 @@ type Model struct {
 	// computed when the delete confirmation opens so the dialog and the delete
 	// command agree on the same set.
 	rel relation
+
+	// filter box, shared by the environment and package lists
+	filter    textinput.Model
+	filtering bool // the box has focus, so it swallows the keys
+
+	// The filter shows a subset of the source list. Both cursors index the
+	// subset, never the source, so a filter change cannot leave a cursor
+	// pointing at a row that is no longer on screen. A nil slice means "no
+	// filter", which every reader treats as the whole list.
+	filteredItems []listItem
+	filteredPkgs  []int // indexes into packages
 }
 
 func New() Model {
@@ -133,12 +144,18 @@ func New() Model {
 	verInput.Placeholder = "3.12  (leave blank for default)"
 	verInput.CharLimit = 16
 
+	filterInput := textinput.New()
+	filterInput.Prompt = "filter: "
+	filterInput.Placeholder = "type to filter"
+	filterInput.CharLimit = 64
+
 	cwd, _ := os.Getwd()
 
 	return Model{
 		state:        stateList,
 		spinner:      sp,
 		createInputs: [2]textinput.Model{nameInput, verInput},
+		filter:       filterInput,
 		cwd:          cwd,
 	}
 }
@@ -388,10 +405,10 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		m.condaEnvs = msg.condaEnvs
 		m.uvEnvs = msg.uvEnvs
 		m.rebuildItems()
-		if m.cursor >= len(m.items) {
-			m.cursor = 0
-		}
-		m.skipHeaders()
+		// The items this rebuild produced are new to the filter, so the visible
+		// list has to be derived from them again — both to match the new arrivals
+		// and to re-anchor the cursor onto whatever it was pointing at.
+		m.applyEnvFilter()
 		// A confirmation dialog holds an index into the old lists. Cancel it
 		// rather than let "y" act on an environment that may be gone.
 		if m.state == stateDeleteConfirm {
@@ -455,7 +472,9 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			}
 			// The list may have shrunk since the last render (a delete, or a
 			// refresh after one), so drop cursor/selection entries that now
-			// point past the end.
+			// point past the end. A filter in force has to be re-derived from the
+			// new list too, or it would keep showing rows that are now gone.
+			m.applyPkgFilter()
 			m.clampPkgCursor()
 			m.pkgLoaded = true
 			// The graph is keyed by these very package names, so it is stored
@@ -507,6 +526,13 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 }
 
 func (m Model) handleKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
+	// While the box has focus it owns the keyboard, including the keys that
+	// would otherwise quit, navigate or delete. Nothing else may run on a
+	// keystroke the user meant as text.
+	if m.filtering {
+		return m.handleFilterKey(msg)
+	}
+
 	switch m.state {
 
 	case stateDeleteConfirm:
@@ -558,14 +584,21 @@ func (m Model) handleKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 		case msg.String() == "ctrl+c":
 			return m, tea.Quit
 
+		case key.Matches(msg, keys.Filter):
+			m.openFilter()
+			return m, nil
+
 		case key.Matches(msg, keys.Cancel), key.Matches(msg, keys.Packages), msg.String() == "q":
 			m.state = stateList
 			m.packages = nil
 			m.pkgSelected = nil
 			// The graph belongs to the environment being left; keeping it would
-			// let the next environment's list show stale relations.
+			// let the next environment's list show stale relations. The filter is
+			// the same kind of leftover: it was typed against a list of packages
+			// this environment does not share.
 			m.deps, m.dependents = nil, nil
 			m.rel = relation{}
+			m.clearFilter()
 			m.pkgLoaded = false
 			return m, nil
 
@@ -573,14 +606,14 @@ func (m Model) handleKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 			// Wrapping matches the environment list, and takes the long way
 			// round from the top of a several-hundred package list to the
 			// bottom, which is quicker than holding the key down.
-			if n := len(m.packages); n > 0 {
-				m.pkgCursor = (m.pkgCursor - 1 + n) % n
+			if n := m.pkgCount(); n > 0 {
+				m.pkgCursor = wrap(m.pkgCursor-1, n)
 			}
 			return m, nil
 
 		case key.Matches(msg, keys.Down):
-			if n := len(m.packages); n > 0 {
-				m.pkgCursor = (m.pkgCursor + 1) % n
+			if n := m.pkgCount(); n > 0 {
+				m.pkgCursor = wrap(m.pkgCursor+1, n)
 			}
 			return m, nil
 
@@ -588,7 +621,13 @@ func (m Model) handleKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 			// Without these guards an empty or not-yet-loaded list would record
 			// a selection for a package that does not exist, and `d` would then
 			// offer to delete it.
-			if !m.pkgLoaded || len(m.packages) == 0 {
+			if !m.pkgLoaded || m.pkgCount() == 0 {
+				return m, nil
+			}
+			// The cursor counts visible rows; the selection counts source rows.
+			// Ticking the first match must mark that package, not package 0.
+			orig, ok := m.pkgAt(m.pkgCursor)
+			if !ok {
 				return m, nil
 			}
 			if m.pkgSelected == nil {
@@ -596,28 +635,42 @@ func (m Model) handleKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 			}
 			// Unticking removes the entry rather than storing false, so that
 			// len(m.pkgSelected) is always the number of ticked packages.
-			i := m.pkgCursor
-			if m.pkgSelected[i] {
-				delete(m.pkgSelected, i)
+			if m.pkgSelected[orig] {
+				delete(m.pkgSelected, orig)
 			} else {
-				m.pkgSelected[i] = true
+				m.pkgSelected[orig] = true
 			}
 			return m, nil
 
 		case key.Matches(msg, keys.All):
-			if !m.pkgLoaded || len(m.packages) == 0 {
+			n := m.pkgCount()
+			if !m.pkgLoaded || n == 0 {
 				return m, nil
 			}
 			if m.pkgSelected == nil {
 				m.pkgSelected = make(map[int]bool)
 			}
-			// If everything is already selected, clear; otherwise select all.
-			if len(m.pkgSelected) == len(m.packages) {
-				m.pkgSelected = make(map[int]bool)
-			} else {
-				m.pkgSelected = make(map[int]bool, len(m.packages))
-				for i := range m.packages {
-					m.pkgSelected[i] = true
+			// "All" means every row on screen — what the user can see they are
+			// choosing. A hidden row keeps whatever it had, so `a` under a filter
+			// never reaches past the list and never quietly drops a tick the user
+			// made before typing.
+			allVisible := true
+			for v := 0; v < n; v++ {
+				orig, ok := m.pkgAt(v)
+				if !ok || !m.pkgSelected[orig] {
+					allVisible = false
+					break
+				}
+			}
+			for v := 0; v < n; v++ {
+				orig, ok := m.pkgAt(v)
+				if !ok {
+					continue
+				}
+				if allVisible {
+					delete(m.pkgSelected, orig)
+				} else {
+					m.pkgSelected[orig] = true
 				}
 			}
 			return m, nil
@@ -682,6 +735,10 @@ func (m Model) handleKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 			}
 			return m, nil
 
+		case key.Matches(msg, keys.Filter):
+			m.openFilter()
+			return m, nil
+
 		case key.Matches(msg, keys.New):
 			m.resetCreateForm()
 			m.state = stateCreate
@@ -705,6 +762,9 @@ func (m Model) handleKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 			m.pkgSelected = make(map[int]bool)
 			m.pkgCursor = 0
 			m.pkgLoaded = false
+			// The environment filter named environments, which say nothing about
+			// this environment's packages. Start the new list unfiltered.
+			m.clearFilter()
 			// Drop the previous environment's graph so the panel cannot pair its
 			// relations with this environment's list while the load is in flight.
 			m.deps, m.dependents = nil, nil
@@ -775,7 +835,8 @@ func (m Model) renderList(w, h int) string {
 	innerH := h - 2
 
 	var sb strings.Builder
-	for i, item := range m.items {
+	list := m.envList()
+	for i, item := range list {
 		if item.kind == kindHeader {
 			line := sectionHeaderStyle.Width(innerW).Render("  " + item.label)
 			sb.WriteString(line + "\n")
@@ -833,6 +894,12 @@ func (m Model) renderList(w, h int) string {
 		sb.WriteString(line + "\n")
 	}
 
+	// An empty panel with a filter on would read as a failed load rather than as
+	// a search that found nothing.
+	if sb.Len() == 0 && m.filterText() != "" {
+		sb.WriteString(itemStyle.Render("  no matches") + "\n")
+	}
+
 	content := sb.String()
 	// Trim to fit height
 	lines := strings.Split(content, "\n")
@@ -866,9 +933,12 @@ func (m Model) renderDetail(w, h int) string {
 
 	sel := m.selectedItem()
 	if sel == nil || sel.kind == kindHeader {
+		// Truncated to the panel before it is placed: Place pads a narrow box but
+		// never clips the text, and a line wider than the panel makes the panel
+		// wrap and grow a row, which pushes the whole layout off the screen.
 		return panelStyle.Width(w).Height(h).Render(
 			lipgloss.Place(innerW, h-2, lipgloss.Center, lipgloss.Center,
-				statusBarStyle.Render("Select an environment")),
+				statusBarStyle.Render(truncate("Select an environment", innerW))),
 		)
 	}
 
@@ -975,9 +1045,11 @@ func (m Model) viewDeleteConfirm() string {
 }
 
 // clampPkgCursor keeps the package cursor and selection within the current list.
+// The cursor is measured against the visible rows and the selection against the
+// source list, because that is what each one is keyed by.
 func (m *Model) clampPkgCursor() {
-	if m.pkgCursor >= len(m.packages) {
-		m.pkgCursor = len(m.packages) - 1
+	if n := m.pkgCount(); m.pkgCursor >= n {
+		m.pkgCursor = n - 1
 	}
 	if m.pkgCursor < 0 {
 		m.pkgCursor = 0
@@ -1010,13 +1082,15 @@ func (m Model) viewPackages() string {
 		return m.viewPackagesTwoColumn()
 	}
 
-	maxRows := len(m.packages)
+	// Sized to the rows on screen, not to the environment's total: with a filter
+	// on, the panel should be as tall as what it is showing.
+	maxRows := m.pkgCount()
 	if maxRows < 1 {
 		maxRows = 1
 	}
 
 	box := m.renderPackagesBox(maxRows)
-	if h := lipgloss.Height(box); h > m.height && len(m.packages) > 0 {
+	if h := lipgloss.Height(box); h > m.height && m.pkgCount() > 0 {
 		// Every row dropped removes exactly one line.
 		maxRows -= h - m.height
 		if maxRows < 1 {
@@ -1057,8 +1131,10 @@ func (m Model) renderPackageList(w, h int) string {
 		maxRows = 1
 	}
 
+	n := m.pkgCount()
+
 	var sb strings.Builder
-	title := fmt.Sprintf("%s  %d packages", m.pkgEnvName(), len(m.packages))
+	title := fmt.Sprintf("%s  %s", m.pkgEnvName(), countLabel(n, len(m.packages), "packages"))
 	sb.WriteString(detailTitleStyle.Render(truncate(title, innerW)) + "\n\n")
 
 	start := 0
@@ -1066,20 +1142,24 @@ func (m Model) renderPackageList(w, h int) string {
 		start = m.pkgCursor - maxRows + 1
 	}
 	end := start + maxRows
-	if end > len(m.packages) {
-		end = len(m.packages)
+	if end > n {
+		end = n
 	}
 
-	for i := start; i < end; i++ {
+	for v := start; v < end; v++ {
+		orig, ok := m.pkgAt(v)
+		if !ok {
+			continue
+		}
 		mark := "[ ]"
-		if m.pkgSelected[i] {
+		if m.pkgSelected[orig] {
 			mark = "[x]"
 		}
-		line := truncate(fmt.Sprintf("%s %s", mark, m.packages[i]), innerW)
+		line := truncate(fmt.Sprintf("%s %s", mark, m.packages[orig]), innerW)
 		switch {
-		case i == m.pkgCursor:
+		case v == m.pkgCursor:
 			line = selectedItemStyle.Render(" " + line)
-		case m.pkgSelected[i]:
+		case m.pkgSelected[orig]:
 			line = successStyle.Render("  " + line)
 		default:
 			line = itemStyle.Render(line)
@@ -1087,9 +1167,13 @@ func (m Model) renderPackageList(w, h int) string {
 		sb.WriteString(line + "\n")
 	}
 
+	if n == 0 && m.filterText() != "" {
+		sb.WriteString(itemStyle.Render("  no matches") + "\n")
+	}
+
 	var footer string
-	if len(m.packages) > maxRows {
-		footer = fmt.Sprintf("%d-%d of %d", start+1, end, len(m.packages))
+	if n > maxRows {
+		footer = fmt.Sprintf("%d-%d of %d", start+1, end, n)
 	}
 	if n := len(m.pkgSelected); n > 0 {
 		if footer != "" {
@@ -1110,11 +1194,12 @@ func (m Model) renderDepPanel(w, h int) string {
 	if innerW < 8 || innerH < 4 {
 		return panelStyle.Width(max(innerW, 1)).Height(max(innerH, 1)).Render("")
 	}
-	if m.pkgCursor < 0 || m.pkgCursor >= len(m.packages) {
+	orig, ok := m.pkgAt(m.pkgCursor)
+	if !ok {
 		return panelStyle.Width(innerW).Height(innerH).Render("")
 	}
 
-	name := m.packages[m.pkgCursor]
+	name := m.packages[orig]
 
 	var sb strings.Builder
 	sb.WriteString(detailTitleStyle.Render(truncate(name, innerW)) + "\n\n")
@@ -1204,6 +1289,15 @@ func (m Model) installedOnly(names []string) []string {
 	return out
 }
 
+// countLabel writes "matched/total unit", or just the total when nothing is
+// filtered out — a bare "631 packages" reads better than "631/631 packages".
+func countLabel(matched, total int, unit string) string {
+	if matched == total {
+		return fmt.Sprintf("%d %s", total, unit)
+	}
+	return fmt.Sprintf("%d/%d %s", matched, total, unit)
+}
+
 // truncate shortens s to at most w runes, marking the cut with an ellipsis.
 // It runs before styling, so plain rune arithmetic is enough.
 func truncate(s string, w int) string {
@@ -1249,34 +1343,45 @@ func (m Model) renderPackagesBox(maxRows int) string {
 	}
 
 	selected := len(m.pkgSelected)
+	n := m.pkgCount()
 
 	var sb strings.Builder
 	sb.WriteString(detailTitleStyle.Render(m.pkgEnvName()) + "  " + badge + "  " +
-		statusBarStyle.Render(fmt.Sprintf("%d packages", len(m.packages))) + "\n\n")
+		statusBarStyle.Render(countLabel(n, len(m.packages), "packages")) + "\n\n")
 
 	if !m.pkgLoaded {
 		sb.WriteString(m.spinner.View() + " loading packages...\n")
-	} else if len(m.packages) == 0 {
-		sb.WriteString(statusBarStyle.Render("No packages found.") + "\n")
+	} else if n == 0 {
+		// A filter that matches nothing and an empty environment are different
+		// problems, and only one of them is the user's to act on.
+		if m.filterText() != "" {
+			sb.WriteString(statusBarStyle.Render("No matching packages.") + "\n")
+		} else {
+			sb.WriteString(statusBarStyle.Render("No packages found.") + "\n")
+		}
 	} else {
 		start := 0
 		if m.pkgCursor >= maxRows {
 			start = m.pkgCursor - maxRows + 1
 		}
 		end := start + maxRows
-		if end > len(m.packages) {
-			end = len(m.packages)
+		if end > n {
+			end = n
 		}
 
-		for i := start; i < end; i++ {
+		for v := start; v < end; v++ {
+			orig, ok := m.pkgAt(v)
+			if !ok {
+				continue
+			}
 			mark := "[ ]"
-			if m.pkgSelected[i] {
+			if m.pkgSelected[orig] {
 				mark = "[x]"
 			}
-			line := fmt.Sprintf("%s %s", mark, m.packages[i])
-			if i == m.pkgCursor {
+			line := fmt.Sprintf("%s %s", mark, m.packages[orig])
+			if v == m.pkgCursor {
 				line = selectedItemStyle.Render(" " + line)
-			} else if m.pkgSelected[i] {
+			} else if m.pkgSelected[orig] {
 				line = successStyle.Render("  " + line)
 			} else {
 				line = itemStyle.Render(line)
@@ -1284,15 +1389,16 @@ func (m Model) renderPackagesBox(maxRows int) string {
 			sb.WriteString(line + "\n")
 		}
 
-		if len(m.packages) > maxRows {
+		if n > maxRows {
 			sb.WriteString(statusBarStyle.Render(
-				fmt.Sprintf("\n  %d-%d of %d", start+1, end, len(m.packages))) + "\n")
+				fmt.Sprintf("\n  %d-%d of %d", start+1, end, n)) + "\n")
 		}
 	}
 
 	sb.WriteString("\n")
 	sb.WriteString(keyStyle.Render("space") + " toggle  " +
 		keyStyle.Render("a") + " all  " +
+		keyStyle.Render("f") + " filter  " +
 		keyStyle.Render("d") + " delete selected  " +
 		keyStyle.Render("esc") + " back")
 
@@ -1482,48 +1588,99 @@ func min(a, b int) int {
 }
 
 func (m Model) renderStatusBar() string {
-	var hints string
-	switch m.state {
-	case stateList:
-		hints = keyStyle.Render("↵") + " activate  " +
-			keyStyle.Render("p") + " packages  " +
-			keyStyle.Render("n") + " new  " +
-			keyStyle.Render("d") + " delete  " +
-			keyStyle.Render("r") + " refresh  " +
-			keyStyle.Render("q") + " quit"
-	default:
-		hints = ""
+	// The box takes the row rather than adding one, so the list above keeps its
+	// height and its position while the user types.
+	if m.filtering {
+		return m.filterLine()
 	}
 
-	var status string
-	if m.statusMsg != "" {
-		if m.statusErr {
-			status = errorStyle.Render("  " + m.statusMsg)
-		} else {
-			status = successStyle.Render("  " + m.statusMsg)
+	msg, msgStyle := m.statusText()
+	return m.statusLine(m.hints(), msg, msgStyle)
+}
+
+// hint is one key and what it does, as shown in the status legend.
+type hint struct{ key, label string }
+
+func (m Model) hints() []hint {
+	switch m.state {
+	case statePackageList:
+		return []hint{
+			{"space", "toggle"}, {"a", "all"}, {"f", "filter"},
+			{"d", "delete"}, {"esc", "back"},
+		}
+	case stateList:
+		return []hint{
+			{"↵", "activate"}, {"p", "packages"}, {"n", "new"}, {"d", "delete"},
+			{"f", "filter"}, {"r", "refresh"}, {"q", "quit"},
 		}
 	}
+	return nil
+}
 
-	bar := statusBarStyle.Width(m.width).Render(" pvman  " + hints + status)
-	return bar
+// renderHints draws as many pairs as fit in room columns, giving up whole pairs
+// from the end. Trimming the finished string instead would cut through the
+// escape sequences the key labels are styled with.
+func renderHints(hints []hint, room int) string {
+	var b strings.Builder
+	used := 0
+	for _, h := range hints {
+		piece := keyStyle.Render(h.key) + " " + h.label + "  "
+		w := lipgloss.Width(piece)
+		if used+w > room {
+			break
+		}
+		used += w
+		b.WriteString(piece)
+	}
+	return b.String()
+}
+
+// statusText is what the status bar has to say, and how to say it. A message
+// about something that just happened outranks the standing note that a filter is
+// narrowing the list.
+func (m Model) statusText() (string, lipgloss.Style) {
+	switch {
+	case m.statusMsg != "" && m.statusErr:
+		return m.statusMsg, errorStyle
+	case m.statusMsg != "":
+		return m.statusMsg, successStyle
+	case m.filterText() != "":
+		return fmt.Sprintf("filter: %q  %d shown", m.filterText(), m.visibleCount()), filterStatusStyle
+	}
+	return "", statusBarStyle
+}
+
+// statusLine assembles the single row the layout reserves for the status bar.
+// lipgloss wraps rather than clips, and a wrapped status bar silently steals a
+// row from the list above it, so the parts are measured and trimmed here
+// instead. What gives way is the key hints: they describe what could happen
+// next, while the message reports what just did.
+func (m Model) statusLine(hints []hint, msg string, msgStyle lipgloss.Style) string {
+	const prefix = " pvman  "
+	room := m.width - lipgloss.Width(prefix)
+
+	// The message is measured as plain text, before it is styled: trimming a
+	// styled string would slice through its escape sequences.
+	msgW := 0
+	if msg != "" {
+		msg = truncate(msg, max(room-2, 0))
+		msgW = 2 + len([]rune(msg))
+		msg = msgStyle.Render("  " + msg)
+	}
+
+	return statusBarStyle.Width(m.width).Render(
+		prefix + renderHints(hints, max(room-msgW, 0)) + msg)
 }
 
 // renderPackageStatusBar renders the key hints and status line under the
 // package view.
 func (m Model) renderPackageStatusBar() string {
-	hints := keyStyle.Render("space") + " toggle  " +
-		keyStyle.Render("a") + " all  " +
-		keyStyle.Render("d") + " delete  " +
-		keyStyle.Render("esc") + " back"
-
-	var status string
-	switch {
-	case m.statusMsg != "" && m.statusErr:
-		status = errorStyle.Render("  " + m.statusMsg)
-	case m.statusMsg != "":
-		status = successStyle.Render("  " + m.statusMsg)
+	if m.filtering {
+		return m.filterLine()
 	}
-	return statusBarStyle.Width(m.width).Render(" " + hints + status)
+
+	msg, msgStyle := m.statusText()
+	return m.statusLine(m.hints(), msg, msgStyle)
 }
 
 // ── helpers ───────────────────────────────────────────────────────────────────
@@ -1545,40 +1702,296 @@ func (m *Model) rebuildItems() {
 }
 
 func (m *Model) skipHeaders() {
-	for m.cursor >= 0 && m.cursor < len(m.items) && m.items[m.cursor].kind == kindHeader {
+	list := m.envList()
+	for m.cursor >= 0 && m.cursor < len(list) && list[m.cursor].kind == kindHeader {
 		m.cursor++
 	}
 }
 
+// wrap folds i into [0,n). Both cursors walk their list this way, so the ends
+// are neighbours rather than walls.
+func wrap(i, n int) int {
+	if n <= 0 {
+		return 0
+	}
+	i %= n
+	if i < 0 {
+		i += n
+	}
+	return i
+}
+
 func (m *Model) moveCursor(dir int) {
-	if len(m.items) == 0 {
+	list := m.envList()
+	if len(list) == 0 {
 		m.cursor = 0
 		return
 	}
 
-	n := len(m.items)
-	next := m.cursor + dir
-	if next < 0 {
-		next = n - 1
-	} else if next >= n {
-		next = 0
-	}
+	n := len(list)
+	m.cursor = wrap(m.cursor, n)
+	next := wrap(m.cursor+dir, n)
 
-	// Skip headers, wrapping around if needed.
-	for m.items[next].kind == kindHeader {
-		next += dir
-		if next < 0 {
-			next = n - 1
-		} else if next >= n {
-			next = 0
-		}
-		// Guard against an all-header list.
-		if next == m.cursor {
-			break
-		}
+	// Skip headers, wrapping around if needed. The hop count bounds the walk, so
+	// a list that is all headers — which a filter over an empty section could
+	// leave behind — cannot spin here forever.
+	for hops := 0; hops < n && list[next].kind == kindHeader; hops++ {
+		next = wrap(next+dir, n)
 	}
 
 	m.cursor = next
+}
+
+// ── filtering ─────────────────────────────────────────────────────────────────
+
+// matchFilter reports whether s contains needle, ignoring case. Containment
+// rather than a prefix or a fuzzy score: package names put their meaning in the
+// middle as often as at the front, and "ng" should find "libgcc-ng".
+func matchFilter(s, needle string) bool {
+	if needle == "" {
+		return true
+	}
+	return strings.Contains(strings.ToLower(s), strings.ToLower(needle))
+}
+
+// filterText is the active filter, or "" when none is applied. Surrounding
+// space is ignored so a stray space does not turn into "no matches".
+func (m Model) filterText() string {
+	return strings.TrimSpace(m.filter.Value())
+}
+
+// envList is the environment list as shown: the filtered subset while a filter
+// is on, the whole list otherwise. The cursor indexes this, never m.items.
+func (m Model) envList() []listItem {
+	if m.filteredItems != nil {
+		return m.filteredItems
+	}
+	return m.items
+}
+
+// pkgCount is the number of package rows on screen.
+func (m Model) pkgCount() int {
+	if m.filteredPkgs != nil {
+		return len(m.filteredPkgs)
+	}
+	return len(m.packages)
+}
+
+// pkgAt maps a visible package row to its index in m.packages. The selection map
+// is keyed by that source index, so ticking survives a change of filter.
+func (m Model) pkgAt(visible int) (int, bool) {
+	if visible < 0 || visible >= m.pkgCount() {
+		return 0, false
+	}
+	if m.filteredPkgs != nil {
+		return m.filteredPkgs[visible], true
+	}
+	return visible, true
+}
+
+// visibleCount is how many rows whichever list is on screen currently shows.
+// Section headers are not counted: they are not something the user can pick, and
+// "4 shown" for two surviving environments reads as a bug in the count.
+func (m Model) visibleCount() int {
+	if m.state == statePackageList {
+		return m.pkgCount()
+	}
+	n := 0
+	for _, it := range m.envList() {
+		if it.kind == kindEnv {
+			n++
+		}
+	}
+	return n
+}
+
+// envAnchor identifies the highlighted environment by what it is rather than
+// where it sits, so it can be found again after the list changes shape.
+type envAnchor struct {
+	envType string
+	idx     int
+}
+
+func (m Model) envAnchorOfCursor() (envAnchor, bool) {
+	if it := m.selectedItem(); it != nil && it.kind == kindEnv {
+		return envAnchor{it.envType, it.idx}, true
+	}
+	return envAnchor{}, false
+}
+
+// applyEnvFilter rebuilds the visible environment list from the filter text and
+// moves the cursor back onto the environment it was on, when that environment
+// is still there.
+func (m *Model) applyEnvFilter() {
+	needle := m.filterText()
+	anchor, had := m.envAnchorOfCursor()
+
+	if needle == "" {
+		m.filteredItems = nil
+	} else {
+		out := make([]listItem, 0, len(m.items))
+		// A section keeps its title only once one of its environments matches, so
+		// a filter cannot leave a heading stranded over an empty stretch.
+		var pending listItem
+		hasPending := false
+		for _, it := range m.items {
+			if it.kind == kindHeader {
+				pending, hasPending = it, true
+				continue
+			}
+			if !matchFilter(it.label, needle) {
+				continue
+			}
+			if hasPending {
+				out = append(out, pending)
+				hasPending = false
+			}
+			out = append(out, it)
+		}
+		m.filteredItems = out
+	}
+
+	list := m.envList()
+	m.cursor = 0
+	if had {
+		for i, it := range list {
+			if it.kind == kindEnv && it.envType == anchor.envType && it.idx == anchor.idx {
+				m.cursor = i
+				break
+			}
+		}
+	}
+	m.cursor = wrap(m.cursor, len(list))
+	m.skipHeaders()
+}
+
+// applyPkgFilter rebuilds the visible package list. pkgSelected is keyed by
+// source index and is left untouched: ticking a few rows and then changing the
+// filter must not lose them.
+func (m *Model) applyPkgFilter() {
+	needle := m.filterText()
+	anchor, had := m.pkgAt(m.pkgCursor)
+
+	if needle == "" {
+		m.filteredPkgs = nil
+	} else {
+		out := make([]int, 0, len(m.packages))
+		for i, name := range m.packages {
+			if matchFilter(name, needle) {
+				out = append(out, i)
+			}
+		}
+		m.filteredPkgs = out
+	}
+
+	m.pkgCursor = 0
+	if had {
+		for v := 0; v < m.pkgCount(); v++ {
+			if orig, ok := m.pkgAt(v); ok && orig == anchor {
+				m.pkgCursor = v
+				break
+			}
+		}
+	}
+	m.pkgCursor = wrap(m.pkgCursor, m.pkgCount())
+}
+
+// reapplyFilter rebuilds whichever list is on screen, after the filter text or
+// the underlying data changed.
+func (m *Model) reapplyFilter() {
+	if m.state == statePackageList {
+		m.applyPkgFilter()
+		return
+	}
+	m.applyEnvFilter()
+}
+
+// clearFilter drops the filter and un-focuses the box. Used whenever the list
+// being filtered is left behind.
+func (m *Model) clearFilter() {
+	m.filter.SetValue("")
+	m.filter.Blur()
+	m.filtering = false
+	m.filteredItems, m.filteredPkgs = nil, nil
+}
+
+// closeFilter closes the box, keeping the filter unless clear is set.
+func (m *Model) closeFilter(clear bool) {
+	if clear {
+		m.filter.SetValue("")
+	}
+	m.filter.Blur()
+	m.filtering = false
+	m.reapplyFilter()
+}
+
+// openFilter gives the box focus without disturbing the filter already in it, so
+// f twice returns to what was typed rather than starting over.
+func (m *Model) openFilter() {
+	m.filtering = true
+	m.filter.Width = m.filterWidth()
+	m.filter.Focus()
+}
+
+// filterWidth is the room the box has on the status row, prompt and cursor
+// included. That row is a fixed one line tall, so the text has to fit it rather
+// than wrap onto a second.
+func (m Model) filterWidth() int {
+	if w := m.width - lipgloss.Width(m.filter.Prompt) - 2; w > 8 {
+		return w
+	}
+	return 8
+}
+
+// handleFilterKey routes keys to the box while it has focus. Up and down still
+// move the list, so matches can be stepped through without leaving the box.
+func (m Model) handleFilterKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
+	switch {
+	case msg.String() == "ctrl+c":
+		return m, tea.Quit
+
+	case key.Matches(msg, keys.Cancel):
+		// esc clears as well as closes. Closing alone would leave rows hidden by
+		// a filter the user can no longer see, with nothing on screen to explain
+		// where they went.
+		m.closeFilter(true)
+		return m, nil
+
+	case msg.String() == "enter":
+		m.closeFilter(false)
+		return m, nil
+
+	// The arrows only, not the j/k aliases the lists use: inside a text box "k"
+	// is a letter, and a filter for "keras" must not walk the cursor upwards.
+	case msg.Type == tea.KeyUp, msg.Type == tea.KeyDown:
+		dir := 1
+		if msg.Type == tea.KeyUp {
+			dir = -1
+		}
+		if m.state == statePackageList {
+			if n := m.pkgCount(); n > 0 {
+				m.pkgCursor = wrap(m.pkgCursor+dir, n)
+			}
+			return m, nil
+		}
+		m.moveCursor(dir)
+		return m, m.triggerDetailLoad()
+	}
+
+	var cmd tea.Cmd
+	m.filter, cmd = m.filter.Update(msg)
+	m.reapplyFilter()
+	return m, cmd
+}
+
+// filterLine renders the box in the row the key hints normally occupy, so
+// opening it does not change the height of the list above it.
+func (m Model) filterLine() string {
+	f := m.filter
+	// Measured again here rather than trusting the width set when the box
+	// opened, so a resize while it is open cannot push the row onto two lines.
+	f.Width = m.filterWidth()
+	return statusBarStyle.Width(m.width).Render(" " + f.View())
 }
 
 func (m Model) activateCmd(item listItem) tea.Cmd {
@@ -1622,8 +2035,9 @@ func (m Model) activateCmd(item listItem) tea.Cmd {
 }
 
 func (m *Model) selectedItem() *listItem {
-	if m.cursor >= 0 && m.cursor < len(m.items) {
-		item := m.items[m.cursor]
+	list := m.envList()
+	if m.cursor >= 0 && m.cursor < len(list) {
+		item := list[m.cursor]
 		return &item
 	}
 	return nil

@@ -16,6 +16,7 @@ type keyMap struct {
 	Confirm  key.Binding
 	Cancel   key.Binding
 	Tab      key.Binding
+	Filter   key.Binding
 }
 
 var keys = keyMap{
@@ -70,5 +71,9 @@ var keys = keyMap{
 	Tab: key.NewBinding(
 		key.WithKeys("tab"),
 		key.WithHelp("tab", "next field"),
+	),
+	Filter: key.NewBinding(
+		key.WithKeys("f"),
+		key.WithHelp("f", "filter"),
 	),
 }

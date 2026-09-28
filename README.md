@@ -32,6 +32,7 @@
 - Delete conda or uv environments with confirmation
 - Activate an environment in a new shell with a single keystroke
 - One-click copy of the activation command
+- Filter environments and packages as you type with `f`
 - Vim-style (`j`/`k`) and arrow key navigation
 
 ## Demo
@@ -139,6 +140,7 @@ Press `esc` to go back to the environment list.
 | `p` | Browse and remove packages |
 | `n` | Create new uv environment |
 | `d` | Delete selected environment |
+| `f` | Filter the list by name |
 | `r` | Refresh list |
 | `q` | Quit |
 | `esc` | Cancel / close dialog |
@@ -151,8 +153,29 @@ Press `esc` to go back to the environment list.
 | `k` / `↑` | Move up |
 | `space` | Tick / untick the highlighted package |
 | `a` | Select all (press again to clear) |
+| `f` | Filter the list by name |
 | `d` | Delete all ticked packages (asks for confirmation) |
 | `esc` / `q` / `p` | Back to the environment list |
+
+### Filtering
+
+`f` opens a filter box in place of the status line. Typing narrows the list to
+the rows containing what you type, ignoring case — `ng` finds `libgcc-ng`, and
+`REQ` finds `requests` and `requests-toolbelt` alike. The box takes the
+keyboard while it is open, so nothing you type can tick, delete or quit.
+
+| Key | Action |
+|-----|--------|
+| `↑` / `↓` | Move the cursor through the matches, without closing the box |
+| `enter` | Close the box and keep the filter on the list |
+| `esc` | Close the box and clear the filter |
+
+With a filter applied, `a` selects the packages **on screen** — a tick you made
+before typing is neither extended to the hidden rows nor dropped, and the title
+reports the subset as `3/631 packages`.
+
+A filter belongs to the list it was typed on: entering an environment's package
+list starts unfiltered, and leaving it clears the filter again.
 
 The panel on the right follows the cursor and shows the highlighted package's
 dependencies in both directions: **needs** (what it requires) and **needed by**

@@ -11,6 +11,7 @@ import (
 	tea "github.com/charmbracelet/bubbletea"
 	"github.com/charmbracelet/lipgloss"
 	"github.com/tkzzzzzz6/pvman/internal/conda"
+	"github.com/tkzzzzzz6/pvman/internal/uv"
 )
 
 // TestMoveCursorWrapAround covers the reported bug where moving up from the
@@ -159,14 +160,14 @@ func runKey(m Model, k tea.KeyMsg) Model {
 }
 
 func pkgModel(n int) Model {
-	return Model{
-		state:       statePackageList,
-		width:       80,
-		height:      24,
-		packages:    mkPkgs(n),
-		pkgSelected: make(map[int]bool),
-		pkgLoaded:   true,
-	}
+	m := New()
+	m.state = statePackageList
+	m.width = 80
+	m.height = 24
+	m.packages = mkPkgs(n)
+	m.pkgSelected = make(map[int]bool)
+	m.pkgLoaded = true
+	return m
 }
 
 // TestUntickDropsSelection guards the invariant that len(pkgSelected) is the
@@ -724,6 +725,433 @@ func TestPackageCursorWraps(t *testing.T) {
 	for _, k := range []tea.KeyMsg{up, down} {
 		if got := runKey(empty, k).pkgCursor; got != 0 {
 			t.Errorf("empty list, key %v: cursor %d, want 0", k, got)
+		}
+	}
+}
+
+// ── filtering ─────────────────────────────────────────────────────────────────
+
+// typeFilter presses f and then types s, leaving the box open.
+func typeFilter(t *testing.T, m Model, s string) Model {
+	t.Helper()
+	m = runKey(m, keyRune('f'))
+	if !m.filtering {
+		t.Fatal("f did not open the filter box")
+	}
+	for _, r := range s {
+		m = runKey(m, keyRune(r))
+	}
+	return m
+}
+
+// envModel builds an environment list with a conda and a uv section, the shape
+// rebuildItems produces from a real scan.
+func envModel(condaNames, uvNames []string) Model {
+	// Built through New() like the real model, so the embedded text inputs are
+	// constructed rather than zero.
+	m := New()
+	m.width = 100
+	m.height = 24
+	for _, n := range condaNames {
+		m.condaEnvs = append(m.condaEnvs, conda.Env{Name: n})
+	}
+	for _, n := range uvNames {
+		m.uvEnvs = append(m.uvEnvs, uv.Env{Name: n})
+	}
+	m.rebuildItems()
+	m.skipHeaders()
+	return m
+}
+
+// listShape renders a list as names, with "=" standing in for a section header,
+// so a test can assert on what is on screen without counting indices.
+func listShape(list []listItem) []string {
+	out := make([]string, 0, len(list))
+	for _, it := range list {
+		if it.kind == kindHeader {
+			out = append(out, "=")
+		} else {
+			out = append(out, it.label)
+		}
+	}
+	return out
+}
+
+func TestMatchFilter(t *testing.T) {
+	cases := []struct {
+		s, needle string
+		want      bool
+	}{
+		{"requests", "quest", true}, // not anchored to either end
+		{"requests", "REQ", true},   // case-insensitive, both directions
+		{"Requests", "que", true},
+		{"libgcc-ng", "gcc", true}, // the meaning is in the middle
+		{"requests", "flask", false},
+		{"requests", "", true}, // no needle matches everything
+		{"", "", true},
+		{"", "x", false},
+	}
+	for _, c := range cases {
+		if got := matchFilter(c.s, c.needle); got != c.want {
+			t.Errorf("matchFilter(%q, %q) = %v, want %v", c.s, c.needle, got, c.want)
+		}
+	}
+}
+
+// TestEnvFilterKeepsOnlyMatchingSections covers the header rule: a section keeps
+// its title only when one of its own environments matched, so a filter cannot
+// leave a heading sitting above nothing.
+func TestEnvFilterKeepsOnlyMatchingSections(t *testing.T) {
+	newModel := func() Model {
+		return envModel([]string{"base", "torch", "myenv"}, []string{"venv-a", "torch-uv"})
+	}
+
+	cases := []struct {
+		filter string
+		want   []string
+	}{
+		// Both sections survive, in their original order.
+		{"torch", []string{"=", "torch", "=", "torch-uv"}},
+		// Only conda matches, so the uv heading must not appear.
+		{"base", []string{"=", "base"}},
+		// Only uv matches: the conda heading must not appear instead.
+		{"venv", []string{"=", "venv-a"}},
+		{"zzz", []string{}},
+		// Case-insensitive, as the box promises.
+		{"TORCH", []string{"=", "torch", "=", "torch-uv"}},
+	}
+
+	for _, c := range cases {
+		m := typeFilter(t, newModel(), c.filter)
+		if got := listShape(m.envList()); !reflect.DeepEqual(got, c.want) {
+			t.Errorf("filter %q: list = %v, want %v", c.filter, got, c.want)
+		}
+	}
+}
+
+// TestEnvFilterReanchorsCursor checks that the highlighted environment stays
+// highlighted while the filter changes, instead of the cursor sliding onto
+// whatever happens to land at the same row number.
+func TestEnvFilterReanchorsCursor(t *testing.T) {
+	m := envModel([]string{"base", "torch", "myenv"}, nil)
+	// items: [= conda, base, torch, myenv]
+	m.cursor = 3 // myenv
+	if got := m.selectedItem(); got == nil || got.label != "myenv" {
+		t.Fatalf("setup: cursor is on %v, want myenv", got)
+	}
+
+	// "e" matches base and myenv; myenv was at 3 and is now at 2.
+	m = typeFilter(t, m, "e")
+	if got := listShape(m.envList()); !reflect.DeepEqual(got, []string{"=", "base", "myenv"}) {
+		t.Fatalf("list = %v", got)
+	}
+	if sel := m.selectedItem(); sel == nil || sel.label != "myenv" {
+		t.Errorf("after filtering, cursor is on %v, want myenv", sel)
+	}
+
+	// Narrowing past the anchor drops it, and the cursor falls back to the top.
+	m = runKey(m, keyRune('z'))
+	if sel := m.selectedItem(); sel != nil {
+		t.Errorf("with no matches the cursor should select nothing, got %v", sel.label)
+	}
+
+	// esc clears, and the cursor returns to where that environment now sits.
+	m = runKey(m, tea.KeyMsg{Type: tea.KeyEsc})
+	if got := m.cursor; got != 1 {
+		t.Errorf("after clearing, cursor = %d, want 1 (base)", got)
+	}
+	if sel := m.selectedItem(); sel == nil || sel.label != "base" {
+		t.Errorf("after clearing, cursor is on %v, want base", sel)
+	}
+}
+
+// TestPkgFilterKeepsTicksOnSourceIndex is the invariant the whole design rests
+// on: the selection is keyed by the package's own index, so changing the filter
+// cannot lose a tick or move it onto a different package.
+func TestPkgFilterKeepsTicksOnSourceIndex(t *testing.T) {
+	m := pkgModel(20)
+	m.pkgCursor = 7
+	m = runKey(m, keyRune(' '))
+	if !m.pkgSelected[7] {
+		t.Fatal("setup: pkg7 was not ticked")
+	}
+
+	// pkg1 and pkg10..pkg19 match; pkg7 does not.
+	m = typeFilter(t, m, "pkg1")
+	if got := m.pkgCount(); got != 11 {
+		t.Fatalf("visible rows = %d, want 11", got)
+	}
+	if !m.pkgSelected[7] {
+		t.Error("filtering dropped a tick that was off screen")
+	}
+
+	// The cursor was on pkg7, which is gone; it falls back to the first match —
+	// and a tick there must mark pkg1, not source row 0 of an unfiltered list.
+	if orig, ok := m.pkgAt(m.pkgCursor); !ok || m.packages[orig] != "pkg1" {
+		t.Errorf("cursor maps to %q, want pkg1", m.packages[orig])
+	}
+	m = runKey(m, tea.KeyMsg{Type: tea.KeyEnter}) // close the box, keep the filter
+	m = runKey(m, keyRune(' '))
+	if !m.pkgSelected[1] {
+		t.Error("ticking the first match did not tick pkg1")
+	}
+	if m.pkgSelected[0] {
+		t.Error("ticking the first match ticked pkg0 instead")
+	}
+}
+
+// TestPackageAllUnderFilter covers the decision that "all" means every row on
+// screen: it must neither reach packages the filter hides nor drop a tick the
+// user made before typing.
+func TestPackageAllUnderFilter(t *testing.T) {
+	m := pkgModel(20)
+	m.pkgCursor = 5
+	m = runKey(m, keyRune(' ')) // tick pkg5, which "pkg1" will hide
+	m = typeFilter(t, m, "pkg1")
+	m = runKey(m, tea.KeyMsg{Type: tea.KeyEnter}) // close the box, keep the filter
+
+	m = runKey(m, keyRune('a'))
+	if got := len(m.pkgSelected); got != 12 {
+		t.Fatalf("after a: %d ticked, want 12 (11 matches + the hidden pkg5)", got)
+	}
+	for i := range m.pkgSelected {
+		if i != 5 && !matchFilter(m.packages[i], "pkg1") {
+			t.Errorf("a ticked %q, which the filter does not match", m.packages[i])
+		}
+	}
+
+	// Pressing it again clears the visible rows only; the hidden tick stays.
+	m = runKey(m, keyRune('a'))
+	if len(m.pkgSelected) != 1 || !m.pkgSelected[5] {
+		t.Errorf("second a left %v, want only the hidden pkg5", m.pkgSelected)
+	}
+}
+
+// TestFilterBoxSwallowsKeys is the guarantee that typing a filter can never
+// delete anything: every key belongs to the box while it has focus.
+func TestFilterBoxSwallowsKeys(t *testing.T) {
+	m := typeFilter(t, pkgModel(20), "pkg1")
+
+	// d would open the delete dialog, q would leave the view, space and a would
+	// tick packages, and j/k would walk the cursor — all of them are text here.
+	for _, r := range "d qjka" {
+		m = runKey(m, keyRune(r))
+	}
+
+	if m.state != statePackageList {
+		t.Errorf("state = %v, want the package list", m.state)
+	}
+	if m.pkgCursor != 0 {
+		t.Errorf("j/k moved the cursor to %d while typing", m.pkgCursor)
+	}
+	if len(m.pkgSelected) != 0 {
+		t.Errorf("space or a ticked %v while typing", m.pkgSelected)
+	}
+	if got := m.filterText(); got != "pkg1d qjka" {
+		t.Errorf("filter = %q, want %q — a key escaped the box", got, "pkg1d qjka")
+	}
+}
+
+// TestFilterArrowsMoveTheList checks the escape hatch: matches can be stepped
+// through without closing the box.
+func TestFilterArrowsMoveTheList(t *testing.T) {
+	down := tea.KeyMsg{Type: tea.KeyDown}
+
+	m := typeFilter(t, pkgModel(20), "pkg1")
+	if m.pkgCursor != 0 {
+		t.Fatalf("setup: cursor = %d, want 0", m.pkgCursor)
+	}
+	m = runKey(m, down)
+	if m.pkgCursor != 1 {
+		t.Errorf("down in the box: cursor = %d, want 1", m.pkgCursor)
+	}
+	// Wrapping still holds inside a filtered list.
+	m.pkgCursor = m.pkgCount() - 1
+	if got := runKey(m, down).pkgCursor; got != 0 {
+		t.Errorf("down from the last match: cursor = %d, want 0", got)
+	}
+
+	// The environment list moves the same way and keeps loading details.
+	e := envModel([]string{"base", "torch", "myenv"}, nil)
+	e = typeFilter(t, e, "e")
+	before := e.cursor
+	e = runKey(e, down)
+	if e.cursor == before {
+		t.Error("down in the environment filter box did not move the cursor")
+	}
+}
+
+// TestFilterWithNoMatchesStaysSafe drives the empty-result case, where the
+// cursor has no row to sit on at all.
+func TestFilterWithNoMatchesStaysSafe(t *testing.T) {
+	m := typeFilter(t, envModel([]string{"base"}, []string{"venv"}), "zzz")
+	if len(m.envList()) != 0 {
+		t.Fatalf("visible rows = %d, want 0", len(m.envList()))
+	}
+	for _, k := range []tea.KeyMsg{{Type: tea.KeyUp}, {Type: tea.KeyDown}} {
+		m = runKey(m, k)
+		if m.cursor != 0 {
+			t.Errorf("cursor = %d with nothing to select, want 0", m.cursor)
+		}
+	}
+	if m.selectedItem() != nil {
+		t.Error("selectedItem returned a row when the list is empty")
+	}
+	// Rendering an empty filtered panel must say so rather than look like a
+	// failed load.
+	if view := stripANSI(m.View()); !strings.Contains(view, "no matches") {
+		t.Error("an empty filtered list does not report that nothing matched")
+	}
+
+	p := typeFilter(t, pkgModel(10), "zzz")
+	for _, k := range []tea.KeyMsg{{Type: tea.KeyUp}, {Type: tea.KeyDown}} {
+		p = runKey(p, k)
+		if p.pkgCursor != 0 {
+			t.Errorf("package cursor = %d with nothing to select, want 0", p.pkgCursor)
+		}
+	}
+	// A tick and a select-all on an empty view must be no-ops, not panics.
+	if got := runKey(runKey(p, keyRune(' ')), keyRune('a')); len(got.pkgSelected) != 0 {
+		t.Errorf("keys on an empty filtered list selected %v", got.pkgSelected)
+	}
+	// Both package layouts have to say it: the two-column one (wide terminal)
+	// and the single centred box (narrow), which are separate render paths.
+	if view := stripANSI(p.View()); !strings.Contains(view, "no matches") {
+		t.Errorf("the two-column package list does not report that nothing matched:\n%s", view)
+	}
+	p.width = 60
+	if view := stripANSI(p.View()); !strings.Contains(view, "No matching packages.") {
+		t.Errorf("the single-column package box does not report that nothing matched:\n%s", view)
+	}
+}
+
+// TestFilterStatusRowStaysOneLine keeps the box from growing the layout: it
+// replaces the key hints, so the list above it keeps its height and position.
+func TestFilterStatusRowStaysOneLine(t *testing.T) {
+	// A status bar that wraps to two rows steals a line from the list above it,
+	// and the whole layout stops matching the terminal. Every width has to hold
+	// one row, filtered or not.
+	for _, width := range []int{20, 40, 60, 100, 200} {
+		m := envModel([]string{"base"}, nil)
+		m.width = width
+
+		check := func(what string, got int) {
+			t.Helper()
+			if got != 1 {
+				t.Errorf("width %d, %s: status row is %d lines tall, want 1", width, what, got)
+			}
+		}
+		check("plain", lipgloss.Height(m.renderStatusBar()))
+
+		// A long filter text and a long status message, each of which has to be
+		// trimmed rather than wrapped.
+		m = runKey(m, keyRune('f'))
+		for _, r := range strings.Repeat("x", 200) {
+			m = runKey(m, keyRune(r))
+		}
+		check("filtering", lipgloss.Height(m.renderStatusBar()))
+		check("filtering, whole view", lipgloss.Height(m.View())-m.height+1)
+
+		m = runKey(m, tea.KeyMsg{Type: tea.KeyEnter})
+		check("filter applied", lipgloss.Height(m.renderStatusBar()))
+
+		m.statusMsg = strings.Repeat("boom ", 40)
+		m.statusErr = true
+		check("long error", lipgloss.Height(m.renderStatusBar()))
+		if got := lipgloss.Height(m.View()); got != m.height {
+			t.Errorf("width %d: view is %d lines tall, want %d", width, got, m.height)
+		}
+	}
+}
+
+// TestStatusHintsShedWholePairs checks the other half of the one-row rule: the
+// legend has to give ground a pair at a time, rather than vanishing the moment
+// the row is tight or being cut mid-escape.
+func TestStatusHintsShedWholePairs(t *testing.T) {
+	m := envModel([]string{"torch-a", "other"}, nil)
+
+	// Wide enough for everything: the filter note does not cost any hints.
+	m.width = 140
+	full := stripANSI(m.renderStatusBar())
+	m = typeFilter(t, m, "torch")
+	m = runKey(m, tea.KeyMsg{Type: tea.KeyEnter})
+	if got := stripANSI(m.renderStatusBar()); !strings.Contains(got, "q quit") {
+		t.Errorf("a filter note crowded out the legend at 140 columns: %q\nwas: %q", got, full)
+	}
+
+	// Narrow: hints go from the end, whole, and never mid-word.
+	m.width = 60
+	got := stripANSI(m.renderStatusBar())
+	for _, want := range []string{"↵ activate", "p packages", `filter: "torch"`} {
+		if !strings.Contains(got, want) {
+			t.Errorf("at 60 columns the row lost %q: %q", want, got)
+		}
+	}
+	if strings.Contains(got, "q qui") && !strings.Contains(got, "q quit") {
+		t.Errorf("a hint was cut mid-word: %q", got)
+	}
+}
+
+// TestFilterLeavesWithTheList checks that a filter typed for one list does not
+// follow the user into the next one, where it would hide rows for no visible
+// reason.
+func TestFilterLeavesWithTheList(t *testing.T) {
+	m := envModel([]string{"base", "torch"}, nil)
+	m = typeFilter(t, m, "torch")
+	m = runKey(m, tea.KeyMsg{Type: tea.KeyEnter}) // keep it, close the box
+
+	// Enter leaves the environment filtered, and the status bar says so.
+	if got := m.filterText(); got != "torch" {
+		t.Fatalf("enter dropped the filter: %q", got)
+	}
+	if view := stripANSI(m.renderStatusBar()); !strings.Contains(view, `filter: "torch"`) {
+		t.Errorf("the status bar does not mention the active filter: %q", view)
+	}
+
+	// The count is of environments, not of rows: the two surviving section
+	// headers are not something the user can pick.
+	two := envModel([]string{"torch-a", "other"}, []string{"torch-b", "else"})
+	two.width = 200
+	two = typeFilter(t, two, "torch")
+	two = runKey(two, tea.KeyMsg{Type: tea.KeyEnter})
+	if view := stripANSI(two.renderStatusBar()); !strings.Contains(view, "2 shown") {
+		t.Errorf("the match count counts headers: %q", view)
+	}
+
+	// Opening a package list for that environment starts clean.
+	m.cursor = 1
+	m = runKey(m, keyRune('p'))
+	if m.state != statePackageList {
+		t.Fatalf("state = %v, want the package list", m.state)
+	}
+	if got := m.filterText(); got != "" {
+		t.Errorf("the environment filter followed into the package list: %q", got)
+	}
+
+	// And leaving the package list clears the one typed there.
+	m.packages = mkPkgs(20)
+	m.pkgLoaded = true
+	m = typeFilter(t, m, "pkg1")
+	m = runKey(m, tea.KeyMsg{Type: tea.KeyEsc})
+	if got := m.filterText(); got != "" {
+		t.Errorf("the package filter survived the return: %q", got)
+	}
+}
+
+// TestPackageCountLabel covers the list title: it reports the subset against the
+// total only when the two differ.
+func TestPackageCountLabel(t *testing.T) {
+	cases := []struct {
+		matched, total int
+		want           string
+	}{
+		{631, 631, "631 packages"},
+		{3, 631, "3/631 packages"},
+		{0, 631, "0/631 packages"},
+	}
+	for _, c := range cases {
+		if got := countLabel(c.matched, c.total, "packages"); got != c.want {
+			t.Errorf("countLabel(%d, %d) = %q, want %q", c.matched, c.total, got, c.want)
 		}
 	}
 }
