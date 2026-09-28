@@ -573,30 +573,40 @@ func (m *Model) rebuildItems() {
 }
 
 func (m *Model) skipHeaders() {
-	for m.cursor < len(m.items) && m.items[m.cursor].kind == kindHeader {
+	for m.cursor >= 0 && m.cursor < len(m.items) && m.items[m.cursor].kind == kindHeader {
 		m.cursor++
 	}
 }
 
 func (m *Model) moveCursor(dir int) {
-	m.cursor += dir
-	if m.cursor < 0 {
+	if len(m.items) == 0 {
 		m.cursor = 0
+		return
 	}
-	if m.cursor >= len(m.items) {
-		m.cursor = len(m.items) - 1
+
+	n := len(m.items)
+	next := m.cursor + dir
+	if next < 0 {
+		next = n - 1
+	} else if next >= n {
+		next = 0
 	}
-	// skip headers
-	for m.cursor < len(m.items) && m.items[m.cursor].kind == kindHeader {
-		m.cursor += dir
+
+	// Skip headers, wrapping around if needed.
+	for m.items[next].kind == kindHeader {
+		next += dir
+		if next < 0 {
+			next = n - 1
+		} else if next >= n {
+			next = 0
+		}
+		// Guard against an all-header list.
+		if next == m.cursor {
+			break
+		}
 	}
-	if m.cursor < 0 {
-		m.cursor = 0
-		m.skipHeaders()
-	}
-	if m.cursor >= len(m.items) {
-		m.cursor = len(m.items) - 1
-	}
+
+	m.cursor = next
 }
 
 func (m *Model) selectedItem() *listItem {

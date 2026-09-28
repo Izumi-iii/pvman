@@ -2,7 +2,7 @@
 set -eu
 
 GO_VERSION="${PV_MAN_GO_VERSION:-1.26.1}"
-GO_ROOT="${HOME}/.local/go"
+GO_ROOT="${HOME}/.local/go${GO_VERSION}"
 GO_BIN="${HOME}/go/bin"
 TMP_DIR="$(mktemp -d)"
 trap 'rm -rf "$TMP_DIR"' EXIT
@@ -43,6 +43,7 @@ else
 fi
 
 mkdir -p "${HOME}/.local"
+mkdir -p "$GO_BIN"
 tar -xzf "$ARCHIVE_PATH" -C "$TMP_DIR"
 rm -rf "$GO_ROOT"
 mv "${TMP_DIR}/go" "$GO_ROOT"
@@ -53,15 +54,27 @@ case "${SHELL:-}" in
     *) SHELL_RC="${HOME}/.profile" ;;
 esac
 
-PATH_LINE='export PATH="$HOME/.local/go/bin:$HOME/go/bin:$PATH"'
+# Add GOPATH/bin so pvman and the versioned wrapper are available.
+# The Go SDK itself is NOT added to PATH, so the user's default `go` is unaffected.
+GO_BIN_PATH_LINE='export PATH="$HOME/go/bin:$PATH"'
 touch "$SHELL_RC"
-if ! grep -Fqx "$PATH_LINE" "$SHELL_RC" 2>/dev/null; then
-    printf '\n# pvman Go installation\n%s\n' "$PATH_LINE" >> "$SHELL_RC"
+if ! grep -Fqx "$GO_BIN_PATH_LINE" "$SHELL_RC" 2>/dev/null; then
+    printf '\n# pvman binaries (pvman + go%s wrapper)\n%s\n' "$GO_VERSION" "$GO_BIN_PATH_LINE" >> "$SHELL_RC"
 fi
 
-export PATH="${GO_ROOT}/bin:${GO_BIN}:${PATH}"
-"${GO_ROOT}/bin/go" version
-"${GO_ROOT}/bin/go" install github.com/tkzzzzzz6/pvman@latest
+# Versioned wrapper: lets users run `go1.26.1 ...` without replacing `go`.
+WRAPPER="$GO_BIN/go$GO_VERSION"
+cat > "$WRAPPER" <<EOF
+#!/bin/sh
+exec "\$HOME/.local/go${GO_VERSION}/bin/go" "\$@"
+EOF
+chmod +x "$WRAPPER"
+
+export GOBIN="$GO_BIN"
+export PATH="$GO_BIN:$PATH"
+
+"$GO_ROOT/bin/go" version
+go"$GO_VERSION" install github.com/tkzzzzzz6/pvman@latest
 
 echo "pvman installed successfully."
 echo "Run: source ${SHELL_RC} && pvman"

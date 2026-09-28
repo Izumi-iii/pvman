@@ -36,23 +36,11 @@
 
 ## Install
 
-### Homebrew (macOS / Linux)
-
-```bash
-brew install <your-tap>/pvman
-```
-
-### Go install
-
-```bash
-go install github.com/tkzzzzzz6/pvman@latest
-```
-
 ### One-line install (Linux / macOS)
 
 The install script automatically detects the operating system and CPU architecture,
-installs Go 1.26.1 to the current user's home directory, configures `PATH`, and
-installs `pvman`:
+downloads Go 1.26.1 to a side directory (`~/.local/go1.26.1`), adds a `go1.26.1`
+wrapper, and installs `pvman`. It does **not** change your default `go` command:
 
 ```bash
 curl -fsSL --connect-timeout 15 --max-time 60 https://raw.githubusercontent.com/tkzzzzzz6/pvman/main/scripts/install.sh | sh
@@ -68,8 +56,14 @@ The script supports Linux and macOS on `amd64` and `arm64`. After installation,
 reload your shell and run the program:
 
 ```bash
-source ~/.bashrc  # use ~/.zshrc for zsh
+source ~/.bashrc  # or use ~/.zshrc for zsh
 pvman
+```
+
+You can also use the downloaded Go directly without affecting your system `go`:
+
+```bash
+go1.26.1 build -ldflags="-s -w" -o pvman .
 ```
 
 To install another Go version, set `PV_MAN_GO_VERSION` before running the script:
@@ -80,8 +74,10 @@ curl -fsSL --connect-timeout 15 --max-time 60 https://raw.githubusercontent.com/
 
 ### One-line install (Windows)
 
-Run the following command in PowerShell. It installs Go 1.26.1 and `pvman` for
-the current Windows user, without requiring administrator privileges:
+Run the following command in PowerShell. It downloads Go 1.26.1 to a side
+directory, adds a `go1.26.1` wrapper, and installs `pvman` for the current
+Windows user, without requiring administrator privileges. Your default `go`
+command is left untouched:
 
 ```powershell
 irm https://raw.githubusercontent.com/tkzzzzzz6/pvman/main/scripts/install.ps1 | iex
@@ -95,106 +91,19 @@ install-pvman.bat
 ```
 
 The Windows installer supports `amd64` and `arm64`. Open a new terminal after
-installation, then run `pvman`.
+installation, then run `pvman` or `go1.26.1`.
 
-### WSL network troubleshooting
+### Go install
 
-If `wget` appears to hang or `curl` reports `Proxy CONNECT aborted`, the problem
-is usually the WSL proxy configuration, not `pvman`. `ping github.com` only tests
-ICMP and does not verify HTTPS or proxy connectivity.
-
-Check the proxy settings currently used by WSL:
+If you already have a working `go` installation, you can install a versioned
+`go1.26.1` command without touching your default `go`. The first time you use
+`go1.26.1`, download the full toolchain:
 
 ```bash
-env | grep -iE '^(http|https|all|no)_proxy='
-git config --global --get-regexp 'http.*proxy|https.*proxy' || true
+go install golang.org/dl/go1.26.1@latest
+go1.26.1 download
+go1.26.1 install github.com/tkzzzzzz6/pvman@latest
 ```
-
-If no proxy is required, temporarily clear the proxy variables and test HTTPS:
-
-```bash
-unset HTTP_PROXY HTTPS_PROXY ALL_PROXY http_proxy https_proxy all_proxy
-curl -I --connect-timeout 10 --max-time 20 https://raw.githubusercontent.com/tkzzzzzz6/pvman/main/scripts/install.sh
-```
-
-If a proxy is required, configure a reachable WSL proxy address instead. The
-installer needs HTTPS access to `raw.githubusercontent.com`, `go.dev`, and Go's
-module proxy. After fixing the network, rerun the installation command.
-
-### Install a specific Go version on Linux
-
-The project requires Go 1.26.1 or newer. Set `GO_VERSION` to the version you want;
-the following commands install Go 1.26.1 on 64-bit x86 Linux:
-
-```bash
-GO_VERSION=1.26.1
-curl -LO "https://go.dev/dl/go${GO_VERSION}.linux-amd64.tar.gz"
-sudo rm -rf /usr/local/go
-sudo tar -C /usr/local -xzf "go${GO_VERSION}.linux-amd64.tar.gz"
-echo 'export PATH=/usr/local/go/bin:$HOME/go/bin:$PATH' >> ~/.bashrc
-source ~/.bashrc
-go version
-```
-
-For ARM64 Linux, replace `linux-amd64` with `linux-arm64` in the download URL and
-use the matching archive name in the `tar` command.
-
-On Ubuntu or Debian, `apt` can install Go quickly, but it does not let you reliably
-select the exact Go version:
-
-```bash
-sudo apt update
-sudo apt install -y golang-go
-go version
-```
-
-If the package manager installs a version older than Go 1.26.1, use the official
-installation commands above instead.
-
-### Fix `invalid go version` when building
-
-If `go version` shows an old release such as Go 1.19.8 and `go build` reports:
-
-```text
-go: errors parsing go.mod:
-invalid go version '1.26.1': must match format 1.23
-```
-
-the active Go toolchain is too old for this project. The `go.mod` file requires
-Go 1.26.1, so installing or selecting Go 1.19 is not sufficient. After installing
-a newer Go version, refresh the shell and verify which executable is being used:
-
-```bash
-source ~/.bashrc
-hash -r
-which go
-go version
-go env GOROOT
-```
-
-`which go` should point to `/usr/local/go/bin/go`, and `go version` should report
-Go 1.26.1 or newer. If Conda still provides the old executable, temporarily leave
-the base environment and reload the shell before building:
-
-```bash
-conda deactivate
-export PATH=/usr/local/go/bin:$HOME/go/bin:$PATH
-go version
-go build -ldflags="-s -w" -o pvman .
-```
-
-Do not fix this error by changing `go.mod` to `go 1.19`; that only hides the
-version mismatch and may cause newer dependencies or language features to fail.
-
-### Download binary
-
-Grab the latest binary for your platform from the [Releases](https://github.com/tkzzzzzz6/pvman/releases) page.
-
-| Platform | File |
-|----------|------|
-| macOS Apple Silicon | `pvman-darwin-arm64` |
-| Linux x86_64 | `pvman-linux-amd64` |
-| Windows x86_64 | `pvman-windows-amd64.exe` |
 
 ## Usage
 
@@ -220,17 +129,17 @@ It will show all your conda environments and scan the current directory for uv v
 
 ## Requirements
 
-- [conda](https://docs.conda.io/) / [miniconda](https://docs.anaconda.com/miniconda/) for conda env support
+- [conda](https://docs.conda.io/) or [miniconda](https://docs.anaconda.com/miniconda/) for conda env support
 - [uv](https://docs.astral.sh/uv/) for uv env support
 
 ## Build from source
 
 ```bash
+go install golang.org/dl/go1.26.1@latest
+go1.26.1 download
 git clone https://github.com/tkzzzzzz6/pvman.git
 cd pvman
-go build -ldflags="-s -w" -o pvman .
+go1.26.1 build -ldflags="-s -w" -o pvman .
 ```
 
-## License
 
-[MIT License](LICENSE)
