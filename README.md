@@ -152,6 +152,8 @@ Press `esc` to go back to the environment list.
 | `d` | Delete all ticked packages (asks for confirmation) |
 | `esc` / `q` / `p` | Back to the environment list |
 
+`ctrl+c` quits from any view.
+
 ## Build from source
 
 ```bash
