@@ -16,17 +16,19 @@
 	</tr>
 </table>
 
-![Go](https://img.shields.io/badge/Go-1.26+-00ADD8?style=flat&logo=go)
-![Platform](https://img.shields.io/badge/platform-macOS%20%7C%20Linux%20%7C%20Windows-lightgrey)
-![License](https://img.shields.io/badge/license-MIT-green)
+[![Go Version](https://img.shields.io/github/go-mod/go-version/tkzzzzzz6/pvman?logo=go&style=flat)](go.mod)
+[![Platform](https://img.shields.io/badge/platform-macOS%20%7C%20Linux%20%7C%20Windows-lightgrey?style=flat)](https://github.com/tkzzzzzz6/pvman)
+[![License](https://img.shields.io/badge/license-MIT-green?style=flat)](LICENSE)
 
 ## Features
 
 - View all **conda** environments with Python version, package count, and size
 - Scan current directory for **uv** virtual environments (`.venv` and named envs)
 - Async detail loading — size and package info loads in the background
+- Browse installed packages and remove them, one at a time or in bulk
 - Create new uv venvs with a specific Python version
 - Delete conda or uv environments with confirmation
+- Activate an environment in a new shell with a single keystroke
 - One-click copy of the activation command
 - Vim-style (`j`/`k`) and arrow key navigation
 
@@ -66,11 +68,11 @@ You can also use the downloaded Go directly without affecting your system `go`:
 go1.26.1 build -ldflags="-s -w" -o pvman .
 ```
 
-To install another Go version, set `PV_MAN_GO_VERSION` before running the script:
+<!-- To install another Go version, set `PV_MAN_GO_VERSION` before running the script:
 
 ```bash
 curl -fsSL --connect-timeout 15 --max-time 60 https://raw.githubusercontent.com/tkzzzzzz6/pvman/main/scripts/install.sh | PV_MAN_GO_VERSION=1.26.1 sh
-```
+``` -->
 
 ### One-line install (Windows)
 
@@ -118,18 +120,37 @@ It will show all your conda environments and scan the current directory for uv v
 Press `enter` on a selected environment to open a new shell with that environment
 activated. Type `exit` in the shell to return to `pvman`.
 
+Press `p` on a selected environment to browse its installed packages. In the
+package view, use `space` to tick the packages you want to remove, `a` to toggle
+select-all, and `d` to delete everything that is ticked (with a confirmation).
+Press `esc` to go back to the environment list.
+
 ## Key Bindings
+
+### Environment list
 
 | Key | Action |
 |-----|--------|
 | `j` / `↓` | Move down |
 | `k` / `↑` | Move up |
 | `enter` | Activate selected environment (opens a new shell) |
+| `p` | Browse and remove packages |
 | `n` | Create new uv environment |
 | `d` | Delete selected environment |
 | `r` | Refresh list |
 | `q` | Quit |
 | `esc` | Cancel / close dialog |
+
+### Package list
+
+| Key | Action |
+|-----|--------|
+| `j` / `↓` | Move down |
+| `k` / `↑` | Move up |
+| `space` | Tick / untick the highlighted package |
+| `a` | Select all (press again to clear) |
+| `d` | Delete all ticked packages (asks for confirmation) |
+| `esc` / `q` / `p` | Back to the environment list |
 
 ## Build from source
 

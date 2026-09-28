@@ -26,6 +26,9 @@ const (
 	stateCreating
 	stateDeleteConfirm
 	stateDeleting
+	statePackageList
+	statePackageDeleteConfirm
+	statePackageDeleting
 )
 
 type itemKind int
@@ -59,6 +62,13 @@ type detailsLoadedMsg struct {
 type envCreatedMsg struct{ err error }
 type envDeletedMsg struct{ err error }
 type activationFinishedMsg struct{ err error }
+type packagesLoadedMsg struct {
+	envType string
+	idx     int
+	pkgs    []string
+	err     error
+}
+type packageDeletedMsg struct{ err error }
 
 type Model struct {
 	state     appState
@@ -82,6 +92,14 @@ type Model struct {
 
 	// delete confirm target
 	deleteTarget listItem
+
+	// package management view
+	pkgEnvType  string
+	pkgIdx      int
+	packages    []string
+	pkgCursor   int
+	pkgSelected map[int]bool
+	pkgLoaded   bool
 }
 
 func New() Model {
@@ -144,13 +162,52 @@ func createEnvCmd(cwd, name, ver string) tea.Cmd {
 
 func deleteEnvCmd(item listItem, cenvs []conda.Env, uenvs []uv.Env) tea.Cmd {
 	return func() tea.Msg {
+		// The lists are captured at confirm time and can be replaced by a
+		// refresh before the user answers, so re-check the index here.
 		var err error
-		if item.envType == "conda" {
+		switch {
+		case item.envType == "conda" && item.idx < len(cenvs):
 			err = conda.DeleteEnv(cenvs[item.idx])
-		} else {
+		case item.envType == "uv" && item.idx < len(uenvs):
 			err = uv.DeleteEnv(uenvs[item.idx])
+		default:
+			err = fmt.Errorf("environment is no longer in the list")
 		}
 		return envDeletedMsg{err: err}
+	}
+}
+
+func loadPackagesCmd(envType string, idx int, cenvs []conda.Env, uenvs []uv.Env) tea.Cmd {
+	return func() tea.Msg {
+		var pkgs []string
+		var err error
+		if envType == "conda" && idx < len(cenvs) {
+			pkgs, err = conda.ListPackages(cenvs[idx])
+		} else if envType == "uv" && idx < len(uenvs) {
+			pkgs, err = uv.ListPackages(uenvs[idx])
+		}
+		return packagesLoadedMsg{envType: envType, idx: idx, pkgs: pkgs, err: err}
+	}
+}
+
+func deletePackagesCmd(envType string, idx int, cenvs []conda.Env, uenvs []uv.Env, selected map[int]bool, pkgs []string) tea.Cmd {
+	return func() tea.Msg {
+		var toDelete []string
+		for i, name := range pkgs {
+			if selected[i] {
+				toDelete = append(toDelete, name)
+			}
+		}
+		if len(toDelete) == 0 {
+			return packageDeletedMsg{err: fmt.Errorf("no packages selected")}
+		}
+		var err error
+		if envType == "conda" && idx < len(cenvs) {
+			err = conda.RemovePackage(cenvs[idx], toDelete...)
+		} else if envType == "uv" && idx < len(uenvs) {
+			err = uv.RemovePackage(uenvs[idx], toDelete...)
+		}
+		return packageDeletedMsg{err: err}
 	}
 }
 
@@ -177,12 +234,19 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			m.cursor = 0
 		}
 		m.skipHeaders()
+		// A confirmation dialog holds an index into the old lists. Cancel it
+		// rather than let "y" act on an environment that may be gone.
+		if m.state == stateDeleteConfirm {
+			m.state = stateList
+			m.statusMsg = ""
+		}
 		return m, m.triggerDetailLoad()
 
 	case detailsLoadedMsg:
-		if msg.envType == "conda" {
+		// The environment may have disappeared while its details were loading.
+		if msg.envType == "conda" && msg.idx < len(m.condaEnvs) {
 			m.condaEnvs[msg.idx] = msg.cenv
-		} else {
+		} else if msg.envType == "uv" && msg.idx < len(m.uvEnvs) {
 			m.uvEnvs[msg.idx] = msg.uenv
 		}
 		if m.state == stateLoadingDetails {
@@ -218,6 +282,56 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			m.statusErr = true
 		} else {
 			m.statusMsg = ""
+		}
+		return m, nil
+
+	case packagesLoadedMsg:
+		if m.state == statePackageList && msg.envType == m.pkgEnvType && msg.idx == m.pkgIdx {
+			if msg.err != nil {
+				m.statusMsg = "Failed to load packages: " + msg.err.Error()
+				m.statusErr = true
+				m.packages = nil
+			} else {
+				m.packages = msg.pkgs
+				m.statusMsg = ""
+			}
+			// The list may have shrunk since the last render (a delete, or a
+			// refresh after one), so drop cursor/selection entries that now
+			// point past the end.
+			m.clampPkgCursor()
+			m.pkgLoaded = true
+		}
+		return m, nil
+
+	case packageDeletedMsg:
+		if msg.err != nil {
+			m.statusMsg = "Failed to delete packages: " + msg.err.Error()
+			m.statusErr = true
+			m.state = statePackageList
+		} else {
+			count := len(m.pkgSelected)
+			m.statusMsg = fmt.Sprintf("Deleted %d package(s).", count)
+			m.statusErr = false
+			m.pkgSelected = make(map[int]bool)
+			m.pkgCursor = 0
+			m.pkgLoaded = false
+			m.state = statePackageList
+			// refresh packages and env details
+			if m.pkgEnvType == "conda" && m.pkgIdx < len(m.condaEnvs) {
+				m.condaEnvs[m.pkgIdx].Loaded = false
+				return m, tea.Batch(
+					loadPackagesCmd(m.pkgEnvType, m.pkgIdx, m.condaEnvs, m.uvEnvs),
+					loadDetailsCmd("conda", m.pkgIdx, m.condaEnvs[m.pkgIdx], uv.Env{}),
+				)
+			}
+			if m.pkgEnvType == "uv" && m.pkgIdx < len(m.uvEnvs) {
+				m.uvEnvs[m.pkgIdx].Loaded = false
+				return m, tea.Batch(
+					loadPackagesCmd(m.pkgEnvType, m.pkgIdx, m.condaEnvs, m.uvEnvs),
+					loadDetailsCmd("uv", m.pkgIdx, conda.Env{}, m.uvEnvs[m.pkgIdx]),
+				)
+			}
+			return m, nil
 		}
 		return m, nil
 
@@ -271,6 +385,104 @@ func (m Model) handleKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 		m.createInputs[m.createFocus], cmd = m.createInputs[m.createFocus].Update(msg)
 		return m, cmd
 
+	case statePackageList:
+		// The list can shrink under us (a delete finished, a refresh returned
+		// fewer packages), so re-anchor the cursor and drop dead selections
+		// before any key touches them.
+		m.clampPkgCursor()
+		switch {
+		case msg.String() == "ctrl+c":
+			return m, tea.Quit
+
+		case key.Matches(msg, keys.Cancel), key.Matches(msg, keys.Packages), msg.String() == "q":
+			m.state = stateList
+			m.packages = nil
+			m.pkgSelected = nil
+			m.pkgLoaded = false
+			return m, nil
+
+		case key.Matches(msg, keys.Up):
+			if m.pkgCursor > 0 {
+				m.pkgCursor--
+			}
+			return m, nil
+
+		case key.Matches(msg, keys.Down):
+			if m.pkgCursor < len(m.packages)-1 {
+				m.pkgCursor++
+			}
+			return m, nil
+
+		case key.Matches(msg, keys.Toggle):
+			// Without these guards an empty or not-yet-loaded list would record
+			// a selection for a package that does not exist, and `d` would then
+			// offer to delete it.
+			if !m.pkgLoaded || len(m.packages) == 0 {
+				return m, nil
+			}
+			if m.pkgSelected == nil {
+				m.pkgSelected = make(map[int]bool)
+			}
+			// Unticking removes the entry rather than storing false, so that
+			// len(m.pkgSelected) is always the number of ticked packages.
+			i := m.pkgCursor
+			if m.pkgSelected[i] {
+				delete(m.pkgSelected, i)
+			} else {
+				m.pkgSelected[i] = true
+			}
+			return m, nil
+
+		case key.Matches(msg, keys.All):
+			if !m.pkgLoaded || len(m.packages) == 0 {
+				return m, nil
+			}
+			if m.pkgSelected == nil {
+				m.pkgSelected = make(map[int]bool)
+			}
+			// If everything is already selected, clear; otherwise select all.
+			if len(m.pkgSelected) == len(m.packages) {
+				m.pkgSelected = make(map[int]bool)
+			} else {
+				m.pkgSelected = make(map[int]bool, len(m.packages))
+				for i := range m.packages {
+					m.pkgSelected[i] = true
+				}
+			}
+			return m, nil
+
+		case key.Matches(msg, keys.Delete):
+			if !m.pkgLoaded {
+				m.statusMsg = "Still loading packages..."
+				m.statusErr = true
+				return m, nil
+			}
+			if len(m.pkgSelected) == 0 {
+				m.statusMsg = "No packages selected. Use space to select, a to select all."
+				m.statusErr = true
+				return m, nil
+			}
+			m.state = statePackageDeleteConfirm
+			return m, nil
+		}
+		return m, nil
+
+	case statePackageDeleteConfirm, statePackageDeleting:
+		if msg.String() == "ctrl+c" {
+			return m, tea.Quit
+		}
+		if m.state == statePackageDeleting {
+			return m, nil // wait for the delete to finish
+		}
+		switch {
+		case key.Matches(msg, keys.Confirm):
+			m.state = statePackageDeleting
+			return m, deletePackagesCmd(m.pkgEnvType, m.pkgIdx, m.condaEnvs, m.uvEnvs, m.pkgSelected, m.packages)
+		case key.Matches(msg, keys.Cancel) || msg.String() == "n":
+			m.state = statePackageList
+		}
+		return m, nil
+
 	case stateList, stateLoadingDetails:
 		switch {
 		case key.Matches(msg, keys.Quit):
@@ -302,6 +514,21 @@ func (m Model) handleKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 			}
 			return m, nil
 
+		case key.Matches(msg, keys.Packages):
+			sel := m.selectedItem()
+			if sel == nil || sel.kind != kindEnv {
+				return m, nil
+			}
+			m.pkgEnvType = sel.envType
+			m.pkgIdx = sel.idx
+			m.packages = nil
+			m.pkgSelected = make(map[int]bool)
+			m.pkgCursor = 0
+			m.pkgLoaded = false
+			m.statusMsg = ""
+			m.state = statePackageList
+			return m, loadPackagesCmd(sel.envType, sel.idx, m.condaEnvs, m.uvEnvs)
+
 		case key.Matches(msg, keys.Refresh):
 			m.statusMsg = ""
 			return m, loadEnvsCmd(m.cwd)
@@ -323,6 +550,10 @@ func (m Model) View() string {
 		return m.viewCreate()
 	case stateDeleteConfirm:
 		return m.viewDeleteConfirm()
+	case statePackageList:
+		return m.viewPackages()
+	case statePackageDeleteConfirm:
+		return m.viewPackageDeleteConfirm()
 	case stateCreating, stateDeleting:
 		action := "Creating"
 		if m.state == stateDeleting {
@@ -330,6 +561,9 @@ func (m Model) View() string {
 		}
 		return lipgloss.Place(m.width, m.height, lipgloss.Center, lipgloss.Center,
 			m.spinner.View()+" "+action+"...")
+	case statePackageDeleting:
+		return lipgloss.Place(m.width, m.height, lipgloss.Center, lipgloss.Center,
+			m.spinner.View()+" Deleting packages...")
 	}
 
 	return m.viewMain()
@@ -548,11 +782,175 @@ func (m Model) viewDeleteConfirm() string {
 	return lipgloss.Place(m.width, m.height, lipgloss.Center, lipgloss.Center, box)
 }
 
+// clampPkgCursor keeps the package cursor and selection within the current list.
+func (m *Model) clampPkgCursor() {
+	if m.pkgCursor >= len(m.packages) {
+		m.pkgCursor = len(m.packages) - 1
+	}
+	if m.pkgCursor < 0 {
+		m.pkgCursor = 0
+	}
+	for i := range m.pkgSelected {
+		if i >= len(m.packages) {
+			delete(m.pkgSelected, i)
+		}
+	}
+}
+
+// pkgEnvName returns the display name of the environment whose packages are shown.
+func (m Model) pkgEnvName() string {
+	if m.pkgEnvType == "conda" && m.pkgIdx < len(m.condaEnvs) {
+		return m.condaEnvs[m.pkgIdx].Name
+	}
+	if m.pkgEnvType == "uv" && m.pkgIdx < len(m.uvEnvs) {
+		return m.uvEnvs[m.pkgIdx].Name
+	}
+	return "?"
+}
+
+// viewPackages renders the package list, shrinking the visible window until the
+// box fits the terminal. The chrome around the list (border, padding, title,
+// hint and the optional status lines) adds a variable number of rows, so the
+// height is measured rather than assumed.
+func (m Model) viewPackages() string {
+	maxRows := len(m.packages)
+	if maxRows < 1 {
+		maxRows = 1
+	}
+
+	box := m.renderPackagesBox(maxRows)
+	if h := lipgloss.Height(box); h > m.height && len(m.packages) > 0 {
+		// Every row dropped removes exactly one line.
+		maxRows -= h - m.height
+		if maxRows < 1 {
+			maxRows = 1
+		}
+		box = m.renderPackagesBox(maxRows)
+	}
+	// On a very short terminal even the chrome does not fit; clip rather than
+	// write a panel taller than the screen.
+	return lipgloss.Place(m.width, m.height, lipgloss.Center, lipgloss.Center, clipHeight(box, m.height))
+}
+
+// clipHeight drops trailing lines so s is at most h lines tall.
+func clipHeight(s string, h int) string {
+	if h <= 0 {
+		return ""
+	}
+	lines := strings.Split(s, "\n")
+	if len(lines) <= h {
+		return s
+	}
+	return strings.Join(lines[:h], "\n")
+}
+
+// renderPackagesBox builds the package panel showing at most maxRows list rows.
+func (m Model) renderPackagesBox(maxRows int) string {
+	var badge string
+	if m.pkgEnvType == "conda" {
+		badge = condaBadgeStyle.Render("conda")
+	} else {
+		badge = uvBadgeStyle.Render("uv")
+	}
+
+	selected := len(m.pkgSelected)
+
+	var sb strings.Builder
+	sb.WriteString(detailTitleStyle.Render(m.pkgEnvName()) + "  " + badge + "  " +
+		statusBarStyle.Render(fmt.Sprintf("%d packages", len(m.packages))) + "\n\n")
+
+	if !m.pkgLoaded {
+		sb.WriteString(m.spinner.View() + " loading packages...\n")
+	} else if len(m.packages) == 0 {
+		sb.WriteString(statusBarStyle.Render("No packages found.") + "\n")
+	} else {
+		start := 0
+		if m.pkgCursor >= maxRows {
+			start = m.pkgCursor - maxRows + 1
+		}
+		end := start + maxRows
+		if end > len(m.packages) {
+			end = len(m.packages)
+		}
+
+		for i := start; i < end; i++ {
+			mark := "[ ]"
+			if m.pkgSelected[i] {
+				mark = "[x]"
+			}
+			line := fmt.Sprintf("%s %s", mark, m.packages[i])
+			if i == m.pkgCursor {
+				line = selectedItemStyle.Render(" " + line)
+			} else if m.pkgSelected[i] {
+				line = successStyle.Render("  " + line)
+			} else {
+				line = itemStyle.Render(line)
+			}
+			sb.WriteString(line + "\n")
+		}
+
+		if len(m.packages) > maxRows {
+			sb.WriteString(statusBarStyle.Render(
+				fmt.Sprintf("\n  %d-%d of %d", start+1, end, len(m.packages))) + "\n")
+		}
+	}
+
+	sb.WriteString("\n")
+	sb.WriteString(keyStyle.Render("space") + " toggle  " +
+		keyStyle.Render("a") + " all  " +
+		keyStyle.Render("d") + " delete selected  " +
+		keyStyle.Render("esc") + " back")
+
+	if m.statusMsg != "" {
+		sb.WriteString("\n")
+		if m.statusErr {
+			sb.WriteString(errorStyle.Render(m.statusMsg))
+		} else {
+			sb.WriteString(successStyle.Render(m.statusMsg))
+		}
+	}
+
+	if selected > 0 {
+		sb.WriteString("\n" + confirmStyle.Render(fmt.Sprintf("%d selected", selected)))
+	}
+
+	width := m.width - 4
+	if width < 4 {
+		width = 4
+	}
+	return panelActiveStyle.Width(width).Padding(1, 2).Render(sb.String())
+}
+
+func (m Model) viewPackageDeleteConfirm() string {
+	var names []string
+	for i, name := range m.packages {
+		if m.pkgSelected[i] {
+			names = append(names, name)
+		}
+	}
+
+	preview := strings.Join(names, ", ")
+	if runes := []rune(preview); len(runes) > 60 {
+		preview = string(runes[:57]) + "..."
+	}
+
+	msg := confirmStyle.Render(fmt.Sprintf("Delete %d package(s) from ", len(names))) +
+		dangerStyle.Render(m.pkgEnvName()) +
+		confirmStyle.Render("?") + "\n\n" +
+		statusBarStyle.Render(preview) + "\n\n" +
+		keyStyle.Render("y") + " confirm  " +
+		keyStyle.Render("esc") + " cancel"
+
+	box := panelActiveStyle.Width(70).Padding(1, 2).Render(msg)
+	return lipgloss.Place(m.width, m.height, lipgloss.Center, lipgloss.Center, box)
+}
+
 func (m Model) renderStatusBar() string {
 	var hints string
 	switch m.state {
 	case stateList:
 		hints = keyStyle.Render("↵") + " activate  " +
+			keyStyle.Render("p") + " packages  " +
 			keyStyle.Render("n") + " new  " +
 			keyStyle.Render("d") + " delete  " +
 			keyStyle.Render("r") + " refresh  " +

@@ -3,16 +3,19 @@ package ui
 import "github.com/charmbracelet/bubbles/key"
 
 type keyMap struct {
-	Up      key.Binding
-	Down    key.Binding
-	New     key.Binding
-	Delete  key.Binding
-	Refresh key.Binding
-	Quit    key.Binding
+	Up       key.Binding
+	Down     key.Binding
+	New      key.Binding
+	Delete   key.Binding
+	Refresh  key.Binding
+	Quit     key.Binding
 	Activate key.Binding
-	Confirm key.Binding
-	Cancel  key.Binding
-	Tab     key.Binding
+	Packages key.Binding
+	Toggle   key.Binding
+	All      key.Binding
+	Confirm  key.Binding
+	Cancel   key.Binding
+	Tab      key.Binding
 }
 
 var keys = keyMap{
@@ -43,6 +46,18 @@ var keys = keyMap{
 	Activate: key.NewBinding(
 		key.WithKeys("enter"),
 		key.WithHelp("↵", "activate"),
+	),
+	Packages: key.NewBinding(
+		key.WithKeys("p"),
+		key.WithHelp("p", "packages"),
+	),
+	Toggle: key.NewBinding(
+		key.WithKeys(" "),
+		key.WithHelp("space", "toggle"),
+	),
+	All: key.NewBinding(
+		key.WithKeys("a"),
+		key.WithHelp("a", "all"),
 	),
 	Confirm: key.NewBinding(
 		key.WithKeys("y"),

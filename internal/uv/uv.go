@@ -2,11 +2,14 @@ package uv
 
 import (
 	"bufio"
+	"bytes"
+	"encoding/json"
 	"fmt"
 	"os"
 	"os/exec"
 	"path/filepath"
 	"runtime"
+	"sort"
 	"strings"
 )
 
@@ -122,6 +125,89 @@ func CreateEnv(dir, name, pythonVer string) error {
 
 func DeleteEnv(env Env) error {
 	return os.RemoveAll(env.Path)
+}
+
+// ListPackages returns the sorted, de-duplicated package names in a venv.
+func ListPackages(env Env) ([]string, error) {
+	py := pythonBinary(env.Path)
+
+	// Try JSON first (modern uv supports --format=json).
+	// uv writes its "Using Python ..." banner and every diagnostic to stderr,
+	// so both streams have to be captured for an error to say anything useful.
+	var stderr bytes.Buffer
+	cmd := exec.Command("uv", "pip", "list", "--python", py, "--format=json")
+	cmd.Stderr = &stderr
+	out, err := cmd.Output()
+	if err == nil {
+		var pkgs []struct {
+			Name string `json:"name"`
+		}
+		if json.Unmarshal(out, &pkgs) == nil {
+			raw := make([]string, 0, len(pkgs))
+			for _, p := range pkgs {
+				raw = append(raw, p.Name)
+			}
+			return dedupeSorted(raw), nil
+		}
+	}
+
+	// Fallback to plain text parsing.
+	stderr.Reset()
+	cmd = exec.Command("uv", "pip", "list", "--python", py)
+	cmd.Stderr = &stderr
+	out, err = cmd.Output()
+	if err != nil {
+		return nil, fmt.Errorf("%v: %s", err, firstLine(stderr.Bytes()))
+	}
+	var raw []string
+	for i, line := range strings.Split(strings.TrimSpace(string(out)), "\n") {
+		if i < 2 {
+			continue // skip the "Package Version" / "------- -------" header
+		}
+		if fields := strings.Fields(strings.TrimSpace(line)); len(fields) > 0 {
+			raw = append(raw, fields[0])
+		}
+	}
+	return dedupeSorted(raw), nil
+}
+
+func dedupeSorted(in []string) []string {
+	seen := make(map[string]bool, len(in))
+	out := make([]string, 0, len(in))
+	for _, n := range in {
+		if n == "" || seen[n] {
+			continue
+		}
+		seen[n] = true
+		out = append(out, n)
+	}
+	sort.Strings(out)
+	return out
+}
+
+func RemovePackage(env Env, pkgs ...string) error {
+	if len(pkgs) == 0 {
+		return nil
+	}
+	py := pythonBinary(env.Path)
+	args := append([]string{"pip", "uninstall", "--python", py}, pkgs...)
+	// uv does not prompt, but capture stderr so failures are reported usefully.
+	if out, err := exec.Command("uv", args...).CombinedOutput(); err != nil {
+		return fmt.Errorf("%v: %s", err, firstLine(out))
+	}
+	return nil
+}
+
+// firstLine keeps CLI error output to one readable line for the status bar.
+func firstLine(b []byte) string {
+	s := strings.TrimSpace(string(b))
+	if i := strings.IndexByte(s, '\n'); i >= 0 {
+		s = s[:i]
+	}
+	if len(s) > 200 {
+		s = s[:200]
+	}
+	return s
 }
 
 func ActivateCmd(env Env) string {
