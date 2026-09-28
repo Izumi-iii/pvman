@@ -2,6 +2,7 @@ package uv
 
 import (
 	"bufio"
+	"fmt"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -127,5 +128,5 @@ func ActivateCmd(env Env) string {
 	if runtime.GOOS == "windows" {
 		return filepath.Join(env.Path, "Scripts", "activate.bat")
 	}
-	return "source " + filepath.Join(env.Path, "bin", "activate")
+	return "source " + fmt.Sprintf("%q", filepath.Join(env.Path, "bin", "activate"))
 }

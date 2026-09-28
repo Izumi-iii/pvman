@@ -3,6 +3,9 @@ package ui
 import (
 	"fmt"
 	"os"
+	"os/exec"
+	"path/filepath"
+	"runtime"
 	"strings"
 
 	"github.com/charmbracelet/bubbles/key"
@@ -55,6 +58,7 @@ type detailsLoadedMsg struct {
 
 type envCreatedMsg struct{ err error }
 type envDeletedMsg struct{ err error }
+type activationFinishedMsg struct{ err error }
 
 type Model struct {
 	state     appState
@@ -208,6 +212,15 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		m.state = stateList
 		return m, loadEnvsCmd(m.cwd)
 
+	case activationFinishedMsg:
+		if msg.err != nil {
+			m.statusMsg = "Activation failed: " + msg.err.Error()
+			m.statusErr = true
+		} else {
+			m.statusMsg = ""
+		}
+		return m, nil
+
 	case tea.KeyMsg:
 		return m.handleKey(msg)
 	}
@@ -270,6 +283,12 @@ func (m Model) handleKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 		case key.Matches(msg, keys.Down):
 			m.moveCursor(1)
 			return m, m.triggerDetailLoad()
+
+		case key.Matches(msg, keys.Activate):
+			if sel := m.selectedItem(); sel != nil && sel.kind == kindEnv {
+				return m, m.activateCmd(*sel)
+			}
+			return m, nil
 
 		case key.Matches(msg, keys.New):
 			m.resetCreateForm()
@@ -533,7 +552,8 @@ func (m Model) renderStatusBar() string {
 	var hints string
 	switch m.state {
 	case stateList:
-		hints = keyStyle.Render("n") + " new  " +
+		hints = keyStyle.Render("↵") + " activate  " +
+			keyStyle.Render("n") + " new  " +
 			keyStyle.Render("d") + " delete  " +
 			keyStyle.Render("r") + " refresh  " +
 			keyStyle.Render("q") + " quit"
@@ -607,6 +627,46 @@ func (m *Model) moveCursor(dir int) {
 	}
 
 	m.cursor = next
+}
+
+func (m Model) activateCmd(item listItem) tea.Cmd {
+	var activate string
+	switch {
+	case item.envType == "conda" && item.idx < len(m.condaEnvs):
+		activate = conda.ActivateCmd(m.condaEnvs[item.idx])
+	case item.envType == "uv" && item.idx < len(m.uvEnvs):
+		activate = uv.ActivateCmd(m.uvEnvs[item.idx])
+	default:
+		return nil
+	}
+
+	var cmd *exec.Cmd
+	switch runtime.GOOS {
+	case "windows":
+		if os.Getenv("PSModulePath") != "" {
+			cmd = exec.Command("powershell", "-NoExit", "-ExecutionPolicy", "Bypass", "-Command", activate)
+		} else {
+			cmd = exec.Command("cmd", "/K", activate)
+		}
+	default:
+		shell := os.Getenv("SHELL")
+		if shell == "" {
+			shell = "bash"
+		}
+		shellName := filepath.Base(shell)
+		// Run activation in a non-interactive shell (avoids loading .zshrc/.bashrc twice),
+		// then exec an interactive shell so the user keeps their prompt/config.
+		if item.envType == "conda" {
+			hook := fmt.Sprintf(`eval "$(conda shell.%s hook)"`, shellName)
+			cmd = exec.Command(shell, "-c", hook+"; "+activate+"; exec "+shell+" -i")
+		} else {
+			cmd = exec.Command(shell, "-c", activate+"; exec "+shell+" -i")
+		}
+	}
+
+	return tea.ExecProcess(cmd, func(err error) tea.Msg {
+		return activationFinishedMsg{err: err}
+	})
 }
 
 func (m *Model) selectedItem() *listItem {

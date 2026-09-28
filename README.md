@@ -115,22 +115,21 @@ pvman
 
 It will show all your conda environments and scan the current directory for uv venvs.
 
+Press `enter` on a selected environment to open a new shell with that environment
+activated. Type `exit` in the shell to return to `pvman`.
+
 ## Key Bindings
 
 | Key | Action |
 |-----|--------|
 | `j` / `↓` | Move down |
 | `k` / `↑` | Move up |
+| `enter` | Activate selected environment (opens a new shell) |
 | `n` | Create new uv environment |
 | `d` | Delete selected environment |
 | `r` | Refresh list |
 | `q` | Quit |
 | `esc` | Cancel / close dialog |
-
-## Requirements
-
-- [conda](https://docs.conda.io/) or [miniconda](https://docs.anaconda.com/miniconda/) for conda env support
-- [uv](https://docs.astral.sh/uv/) for uv env support
 
 ## Build from source
 
@@ -143,3 +142,7 @@ go1.26.1 build -ldflags="-s -w" -o pvman .
 ```
 
 
+## Requirements
+
+- [conda](https://docs.conda.io/) or [miniconda](https://docs.anaconda.com/miniconda/) for conda env support
+- [uv](https://docs.astral.sh/uv/) for uv env support

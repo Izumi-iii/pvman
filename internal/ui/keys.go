@@ -9,6 +9,7 @@ type keyMap struct {
 	Delete  key.Binding
 	Refresh key.Binding
 	Quit    key.Binding
+	Activate key.Binding
 	Confirm key.Binding
 	Cancel  key.Binding
 	Tab     key.Binding
@@ -38,6 +39,10 @@ var keys = keyMap{
 	Quit: key.NewBinding(
 		key.WithKeys("q", "ctrl+c"),
 		key.WithHelp("q", "quit"),
+	),
+	Activate: key.NewBinding(
+		key.WithKeys("enter"),
+		key.WithHelp("↵", "activate"),
 	),
 	Confirm: key.NewBinding(
 		key.WithKeys("y"),
