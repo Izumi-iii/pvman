@@ -3,6 +3,7 @@ package ui
 import (
 	"fmt"
 	"reflect"
+	"regexp"
 	"sort"
 	"strings"
 	"testing"
@@ -644,6 +645,93 @@ func TestDepSectionHonoursBudget(t *testing.T) {
 		}
 	}
 }
+
+// TestActiveMarkerSitsBesideName covers the marker's position: it labels the
+// environment, so it belongs against the name rather than out past the version.
+// Its column is reserved on every row so the versions stay aligned.
+func TestActiveMarkerSitsBesideName(t *testing.T) {
+	m := New()
+	m.width, m.height = 90, 20
+	m.condaEnvs = []conda.Env{
+		{Name: "base", PythonVer: "3.12.9", Active: true},
+		{Name: "agent", PythonVer: "3.11.4"},
+		{Name: "data", PythonVer: "3.10.1", Active: true},
+	}
+	m.rebuildItems()
+
+	rows := map[string]string{}
+	versions := map[string]int{}
+	for _, line := range strings.Split(stripANSI(m.renderList(80, 20)), "\n") {
+		for _, name := range []string{"base", "agent", "data"} {
+			if !strings.Contains(line, name) {
+				continue
+			}
+			rows[name] = line
+			if i := strings.Index(line, "3.1"); i >= 0 {
+				versions[name] = i
+			}
+		}
+	}
+
+	for _, name := range []string{"base", "agent", "data"} {
+		if rows[name] == "" {
+			t.Fatalf("no row rendered for %q", name)
+		}
+	}
+	if !strings.Contains(rows["base"], "* base") {
+		t.Errorf("base row does not lead with the marker: %q", rows["base"])
+	}
+	if !strings.Contains(rows["data"], "* data") {
+		t.Errorf("data row does not lead with the marker: %q", rows["data"])
+	}
+	if strings.Contains(rows["agent"], "*") {
+		t.Errorf("inactive agent row carries a marker: %q", rows["agent"])
+	}
+	if versions["base"] != versions["agent"] || versions["base"] != versions["data"] {
+		t.Errorf("versions are not aligned: base=%d agent=%d data=%d",
+			versions["base"], versions["agent"], versions["data"])
+	}
+}
+
+// TestPackageCursorWraps matches the package list to the environment list,
+// where the arrows wrap rather than stopping at the ends.
+func TestPackageCursorWraps(t *testing.T) {
+	up := tea.KeyMsg{Type: tea.KeyUp}
+	down := tea.KeyMsg{Type: tea.KeyDown}
+
+	m := pkgModel(4)
+	m.pkgCursor = 0
+	if got := runKey(m, up).pkgCursor; got != 3 {
+		t.Errorf("up from the first package: cursor %d, want 3", got)
+	}
+
+	m.pkgCursor = 3
+	if got := runKey(m, down).pkgCursor; got != 0 {
+		t.Errorf("down from the last package: cursor %d, want 0", got)
+	}
+
+	// A single package wraps onto itself rather than moving out of range.
+	single := pkgModel(1)
+	if got := runKey(single, up).pkgCursor; got != 0 {
+		t.Errorf("up with one package: cursor %d, want 0", got)
+	}
+	if got := runKey(single, down).pkgCursor; got != 0 {
+		t.Errorf("down with one package: cursor %d, want 0", got)
+	}
+
+	// An empty list must not produce a negative or out-of-range cursor.
+	empty := pkgModel(0)
+	for _, k := range []tea.KeyMsg{up, down} {
+		if got := runKey(empty, k).pkgCursor; got != 0 {
+			t.Errorf("empty list, key %v: cursor %d, want 0", k, got)
+		}
+	}
+}
+
+// stripANSI removes SGR sequences so layout can be measured in plain columns.
+var ansiRE = regexp.MustCompile("\x1b\\[[0-9;]*m")
+
+func stripANSI(s string) string { return ansiRE.ReplaceAllString(s, "") }
 
 func contains(haystack []string, needle string) bool {
 	for _, s := range haystack {

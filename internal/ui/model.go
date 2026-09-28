@@ -570,14 +570,17 @@ func (m Model) handleKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 			return m, nil
 
 		case key.Matches(msg, keys.Up):
-			if m.pkgCursor > 0 {
-				m.pkgCursor--
+			// Wrapping matches the environment list, and takes the long way
+			// round from the top of a several-hundred package list to the
+			// bottom, which is quicker than holding the key down.
+			if n := len(m.packages); n > 0 {
+				m.pkgCursor = (m.pkgCursor - 1 + n) % n
 			}
 			return m, nil
 
 		case key.Matches(msg, keys.Down):
-			if m.pkgCursor < len(m.packages)-1 {
-				m.pkgCursor++
+			if n := len(m.packages); n > 0 {
+				m.pkgCursor = (m.pkgCursor + 1) % n
 			}
 			return m, nil
 
@@ -807,12 +810,20 @@ func (m Model) renderList(w, h int) string {
 			}
 		}
 
-		nameW := innerW - 8
+		// The marker belongs beside the name, not out past the version. Its
+		// column is reserved on every row — blank when the environment is not
+		// the active one — so the versions still line up.
+		marker := "  "
+		if activeMarker != "" {
+			marker = activeMarker + " "
+		}
+
+		nameW := innerW - 10
 		if nameW < 10 {
 			nameW = 10
 		}
 
-		line := fmt.Sprintf("%-*s %s %s", nameW, name, verStr, activeMarker)
+		line := marker + fmt.Sprintf("%-*s %s", nameW, name, verStr)
 
 		if i == m.cursor {
 			line = selectedItemStyle.Width(innerW).Render(" " + line)
